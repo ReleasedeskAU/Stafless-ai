@@ -163,6 +163,11 @@ fi
 
 # --- 6. Switch search settings off local nomic → OpenAI embeddings -------------
 # UI values: web/src/lib/indexing/index.ts (text-embedding-3-small, dim 1536, normalize false).
+# SearchSettingsCreationRequest requires index_name (str | None). The UI sends
+# null and the server fills danswer_chunk_{clean_model_name(model)} — see
+# search_settings.py and embedding_configs.py. Do not delete the field (422).
+# Do not reuse the current nomic index_name. Send the same computed name the
+# server would generate (hyphens/slashes/dots → underscores, lowercased).
 code="$(json_header "${base}/search-settings/get-current-search-settings")"
 if [ "$code" != "200" ]; then
   echo "get-current-search-settings failed HTTP ${code}" >&2
@@ -171,17 +176,9 @@ if [ "$code" != "200" ]; then
   exit 1
 fi
 
-search_payload="$(jq -c --arg m "$embed_model" --argjson d "$embed_dim" '
-  .model_name = $m
-  | .model_dim = $d
-  | .normalize = false
-  | .query_prefix = ""
-  | .passage_prefix = ""
-  | .provider_type = "openai"
-  | .enable_contextual_rag = false
-  | .contextual_rag_model_configuration_id = null
-  | del(.id, .use_port_flow, .index_name, .api_key)
-' "$body")"
+overlay_dir="$(cd "$(dirname "$0")" && pwd)"
+search_payload="$(jq -c --arg m "$embed_model" --argjson d "$embed_dim" \
+  -f "${overlay_dir}/search-settings-payload.jq" "$body")"
 
 code="$(json_header -X POST "${base}/search-settings/set-new-search-settings" -d "$search_payload")"
 if [ "$code" != "200" ]; then
