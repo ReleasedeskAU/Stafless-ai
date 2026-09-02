@@ -68,6 +68,7 @@ clean.”
 Add paths here when the display rebrand (or other overlay) lands.
 
 - `UPSTREAM-SYNC.md` — this document
+- `README.md` — StaffLess AI fork readme (foss regenerates theirs on every force-push)
 
 ## Procedure A — try a normal merge first (fast path)
 
