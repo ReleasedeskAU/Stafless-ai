@@ -69,6 +69,19 @@ Add paths here when the display rebrand (or other overlay) lands.
 
 - `UPSTREAM-SYNC.md` — this document
 - `README.md` — StaffLess AI fork readme (foss regenerates theirs on every force-push)
+- `backend/onyx/configs/constants.py` — `ONYX_DEFAULT_APPLICATION_NAME` value only
+- `backend/onyx/main.py` — OpenAPI title/description
+- `backend/onyx/mcp_server/api.py` — OpenAPI title
+- `backend/onyx/skills/ingest_from_github.py` — skill name conflict error
+- `backend/onyx/tools/tool_constructor.py` — chat tool setup errors
+- `backend/onyx/tools/tool_implementations/open_url/open_url_tool.py` — crawler error
+- `backend/onyx/server/manage/llm/api.py` — LLM reachability errors
+- `backend/onyx/server/manage/search_settings.py` — contextual RAG error
+- `backend/tests/unit/onyx/auth/test_email_branding.py`
+- `backend/tests/unit/onyx/auth/test_application_name_overlay.py`
+- `backend/tests/unit/onyx/server/test_openapi_branding.py`
+- `backend/tests/unit/onyx/skills/test_ingest_from_github.py`
+- `backend/tests/external_dependency_unit/craft/test_skill_github_import.py`
 
 ## Procedure A — try a normal merge first (fast path)
 

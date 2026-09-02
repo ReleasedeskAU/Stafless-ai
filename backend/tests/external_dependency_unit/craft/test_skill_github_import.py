@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from onyx.configs.constants import ONYX_DEFAULT_APPLICATION_NAME
 from onyx.db.models import Skill, User, UserSkillPreference
 from onyx.file_store.file_store import get_default_file_store
 from onyx.server.features.skill.api import import_github_skills
@@ -75,7 +76,9 @@ def test_import_creates_conflicting_skills_disabled_without_blocking_others(
             name="pptx",
             description="Presentations",
             bundle_bytes=None,
-            unavailable_reason="A built-in Onyx skill already uses this name.",
+            unavailable_reason=(
+                f"A built-in {ONYX_DEFAULT_APPLICATION_NAME} skill already uses this name."
+            ),
         ),
     ]
     monkeypatch.setattr(
@@ -119,7 +122,10 @@ def test_import_creates_conflicting_skills_disabled_without_blocking_others(
     assert imported_by_name[unique_name].skill.enabled is True
     assert imported_by_name[unique_name].disabled_reason is None
     assert [(item.name, item.reason) for item in response.not_imported] == [
-        ("pptx", "A built-in Onyx skill already uses this name.")
+        (
+            "pptx",
+            f"A built-in {ONYX_DEFAULT_APPLICATION_NAME} skill already uses this name.",
+        )
     ]
     assert pushed_user_ids == [{test_user.id}]
 

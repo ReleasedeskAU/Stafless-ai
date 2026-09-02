@@ -52,7 +52,10 @@ from onyx.configs.app_configs import (
     USER_AUTH_SECRET,
     WEB_DOMAIN,
 )
-from onyx.configs.constants import POSTGRES_WEB_APP_NAME
+from onyx.configs.constants import (
+    ONYX_DEFAULT_APPLICATION_NAME,
+    POSTGRES_WEB_APP_NAME,
+)
 from onyx.db.engine.async_sql_engine import (
     get_sqlalchemy_async_engine,
     reset_sqlalchemy_async_engine,
@@ -515,11 +518,17 @@ def log_http_error(request: Request, exc: Exception) -> JSONResponse:
 
 def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     application = FastAPI(
-        title="Onyx Backend",
+        title=f"{ONYX_DEFAULT_APPLICATION_NAME} Backend",
         version=__version__,
-        description="Onyx API for AI-powered chat with search, document indexing, agents, actions, and more",
+        description=(
+            f"{ONYX_DEFAULT_APPLICATION_NAME} API for AI-powered chat with search, "
+            "document indexing, agents, actions, and more"
+        ),
         servers=[
-            {"url": f"{WEB_DOMAIN.rstrip('/')}/api", "description": "Onyx API Server"}
+            {
+                "url": f"{WEB_DOMAIN.rstrip('/')}/api",
+                "description": f"{ONYX_DEFAULT_APPLICATION_NAME} API Server",
+            }
         ],
         # The interactive docs and schema are opt-in (see ENABLE_PUBLIC_DOCS).
         # When disabled, these routes are not registered at all (404), so the

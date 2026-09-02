@@ -5,7 +5,8 @@ import re
 import socket
 from enum import Enum, auto
 
-ONYX_DEFAULT_APPLICATION_NAME = "Onyx"
+# Display name in emails, OpenAPI titles, and API error text. Identifier stays ONYX_*.
+ONYX_DEFAULT_APPLICATION_NAME = "StaffLess AI"
 ONYX_DISCORD_URL = "https://discord.gg/4NA5SbzrWb"
 ONYX_UTM_SOURCE = "onyx_app"
 SLACK_USER_TOKEN_PREFIX = "xoxp-"

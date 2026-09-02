@@ -8,6 +8,7 @@ from typing_extensions import override
 
 from onyx.chat.emitter import Emitter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
+from onyx.configs.constants import ONYX_DEFAULT_APPLICATION_NAME
 from onyx.context.search.models import (
     IndexFilters,
     InferenceSection,
@@ -461,7 +462,7 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
                 raise RuntimeError(
                     "No web content provider available. "
                     "Please configure a content provider or ensure the "
-                    "built-in Onyx web crawler can be initialized."
+                    f"built-in {ONYX_DEFAULT_APPLICATION_NAME} web crawler can be initialized."
                 )
             self._provider = provider
 

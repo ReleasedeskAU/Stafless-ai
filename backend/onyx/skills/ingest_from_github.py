@@ -8,6 +8,7 @@ import zipfile
 from pathlib import PurePosixPath
 from typing import Final
 
+from onyx.configs.constants import ONYX_DEFAULT_APPLICATION_NAME
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.skills.built_in import BUILT_IN_SKILLS
@@ -227,7 +228,10 @@ def fetch_github_skill_bundles(
                     name=document.metadata.name,
                     description=document.metadata.description,
                     bundle_bytes=None,
-                    unavailable_reason="A built-in Onyx skill already uses this name.",
+                    unavailable_reason=(
+                        f"A built-in {ONYX_DEFAULT_APPLICATION_NAME} skill already "
+                        "uses this name."
+                    ),
                 )
             )
             continue

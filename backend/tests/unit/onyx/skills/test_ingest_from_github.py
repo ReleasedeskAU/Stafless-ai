@@ -9,6 +9,7 @@ from urllib.parse import unquote
 
 import pytest
 
+from onyx.configs.constants import ONYX_DEFAULT_APPLICATION_NAME
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.skills import ingest_from_github
@@ -137,7 +138,7 @@ def test_invalid_and_reserved_skills_do_not_block_valid_skills(
     )
     assert by_name["pptx"].bundle_bytes is None
     assert by_name["pptx"].unavailable_reason == (
-        "A built-in Onyx skill already uses this name."
+        f"A built-in {ONYX_DEFAULT_APPLICATION_NAME} skill already uses this name."
     )
 
 

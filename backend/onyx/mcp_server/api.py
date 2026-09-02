@@ -12,6 +12,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
 from onyx.configs.app_configs import MCP_SERVER_CORS_ORIGINS
+from onyx.configs.constants import ONYX_DEFAULT_APPLICATION_NAME
 from onyx.error_handling.exceptions import register_onyx_exception_handlers
 from onyx.mcp_server.auth import OnyxTokenVerifier
 from onyx.mcp_server.utils import shutdown_http_client
@@ -81,7 +82,7 @@ def create_mcp_fastapi_app() -> FastAPI:
             await shutdown_http_client()
 
     app = FastAPI(
-        title="Onyx MCP Server",
+        title=f"{ONYX_DEFAULT_APPLICATION_NAME} MCP Server",
         description="HTTP POST transport with bearer auth delegated to API /me",
         version="1.0.0",
         lifespan=combined_lifespan,

@@ -11,6 +11,7 @@ from onyx.background.celery.tasks.port.tasks import (
 )
 from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.configs.app_configs import DISABLE_INDEX_UPDATE_ON_SWAP
+from onyx.configs.constants import ONYX_DEFAULT_APPLICATION_NAME
 from onyx.context.search.models import (
     ContextualRagModelUpdateResponse,
     SavedSearchSettings,
@@ -99,7 +100,7 @@ def set_new_search_settings(
     if MULTI_TENANT and search_settings_new.enable_contextual_rag:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Contextual RAG disabled in Onyx Cloud",
+            detail=f"Contextual RAG disabled in {ONYX_DEFAULT_APPLICATION_NAME} Cloud",
         )
 
     # Validate cloud provider exists or create new LiteLLM provider.
@@ -532,7 +533,7 @@ def update_saved_search_settings(
     if MULTI_TENANT and search_settings.enable_contextual_rag:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "Contextual RAG disabled in Onyx Cloud",
+            f"Contextual RAG disabled in {ONYX_DEFAULT_APPLICATION_NAME} Cloud",
         )
 
     if (
