@@ -21,8 +21,9 @@ MIT (same as onyx-foss). This tree does **not** include Onyx Enterprise
 
 Do not pull Docker Hub `onyxdotapp/onyx-backend` — those images are built
 from the main Onyx repo and include Enterprise code. Build the backend
-from **this** tree (`--target runtime`). Prep files live in the
-ReleaseDesk repo under `docs/onyx-deploy/`.
+from **this** tree (`--target runtime`). ReleaseDesk overlay, env template,
+nginx, and first-boot script live in
+[`deployment/releasedesk-overlay/`](deployment/releasedesk-overlay/).
 
 ## Syncing from upstream
 

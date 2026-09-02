@@ -1,0 +1,76 @@
+# In-compose nginx (alpine image). Not Ubuntu host nginx — 24.04 vs 22.04
+# does not change this file. Same routing for onyx-foss or main: stock nginx
+# sent location / to web_server; this template sends everything to api_server.
+#
+# Don't expose the nginx version in the Server header or on error pages
+server_tokens off;
+
+# Log format to include request latency
+log_format custom_main '$remote_addr - $remote_user [$time_local] "$request" '
+                '$status $body_bytes_sent "$http_referer" '
+                '"$http_user_agent" "$http_x_forwarded_for" '
+                'rt=$request_time';
+
+upstream api_server {
+    server api_server:8080 fail_timeout=0;
+}
+
+# Conditionally include MCP upstream configuration
+include /etc/nginx/conf.d/mcp_upstream.conf.inc;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80 default_server;
+
+    client_max_body_size 5G;
+
+    access_log /var/log/nginx/access.log custom_main;
+
+    include /etc/nginx/conf.d/mcp.conf.inc;
+
+    location = /nginx-health {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    # Strip /api so callers can use either http://host/api/... or http://host/...
+    location ~ ^/(api|openapi.json)(/.*)?$ {
+        rewrite ^/api(/.*)$ $1 break;
+
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_set_header Host $host;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_redirect off;
+        proxy_pass http://api_server;
+    }
+
+    # Auth, Swagger (/docs), health, PATs, and every other API path.
+    # Stock upstream nginx sent location / to web_server — that container is excluded.
+    location / {
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_set_header Host $host;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_redirect off;
+        proxy_pass http://api_server;
+    }
+}

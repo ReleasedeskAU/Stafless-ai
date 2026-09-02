@@ -1,0 +1,123 @@
+# ReleaseDesk Everywhere overlay for StaffLess AI (this Stafless-ai fork).
+# Does not replace docker-compose.yml — merge it last so these limits win over
+# docker-compose.resources.yml (whose background 10g default would OOM D4as_v5).
+#
+# MUST run from this checkout's deployment/docker_compose (stock
+# build.context is ../../backend). Do not `up` against Hub tags.
+#   docker compose -f docker-compose.yml -f docker-compose.resources.yml \
+#     -f ../releasedesk-overlay/docker-compose.releasedesk.yml \
+#     build api_server background
+#   docker compose -f docker-compose.yml -f docker-compose.resources.yml \
+#     -f ../releasedesk-overlay/docker-compose.releasedesk.yml up -d --wait
+#
+# Overlay does not set build.context — that path is relative to THIS file
+# (deployment/releasedesk-overlay), which is the wrong tree. Stock foss
+# compose already builds ../../backend --target runtime when you `compose build`.
+#
+# Bind mounts resolve from the first compose file's directory
+# (deployment/docker_compose), so nginx templates use ../releasedesk-overlay/nginx.
+#
+# This overlay:
+#   - Does not start web_server (StaffLess AI UI) or local model servers
+#   - Makes nginx independent of web_server and proxies all traffic to the API
+#   - Makes model-server depends_on optional
+#   - Caps RAM for D4as_v5 / D4s_v5 (16 GB). Host OS (Ubuntu 24.04) does not
+#     change these limits. In-compose nginx is not host nginx.
+
+name: onyx
+
+services:
+  web_server:
+    profiles: ["onyx-ui"]
+
+  inference_model_server:
+    profiles: ["local-models"]
+
+  indexing_model_server:
+    profiles: ["local-models"]
+
+  api_server:
+    depends_on:
+      inference_model_server:
+        condition: service_started
+        required: false
+    environment:
+      - DISABLE_MODEL_SERVER=true
+      - MODEL_SERVER_HOST=disabled
+      - INDEXING_MODEL_SERVER_HOST=disabled
+      - FILE_STORE_BACKEND=${FILE_STORE_BACKEND:-postgres}
+    deploy:
+      resources:
+        limits:
+          cpus: ${API_SERVER_CPU_LIMIT:-1.0}
+          memory: ${API_SERVER_MEM_LIMIT:-1536m}
+
+  background:
+    depends_on:
+      inference_model_server:
+        condition: service_started
+        required: false
+      indexing_model_server:
+        condition: service_started
+        required: false
+    environment:
+      - DISABLE_MODEL_SERVER=true
+      - MODEL_SERVER_HOST=disabled
+      - INDEXING_MODEL_SERVER_HOST=disabled
+      - FILE_STORE_BACKEND=${FILE_STORE_BACKEND:-postgres}
+    deploy:
+      resources:
+        limits:
+          cpus: ${BACKGROUND_CPU_LIMIT:-1.5}
+          memory: ${BACKGROUND_MEM_LIMIT:-2g}
+
+  nginx:
+    # Stock compose hard-requires web_server healthy or nginx never starts.
+    depends_on:
+      api_server:
+        condition: service_healthy
+      web_server:
+        condition: service_started
+        required: false
+    volumes:
+      # Replaces stock ../data/nginx so we never resolve web_server in upstream.
+      # Path is relative to deployment/docker_compose (first -f file), not this overlay.
+      - ../releasedesk-overlay/nginx:/nginx-templates:ro
+    command: >
+      /bin/sh -c "rm -f /etc/nginx/conf.d/default.conf
+      && cp -a /nginx-templates/. /etc/nginx/conf.d/
+      && sed 's/\r$//' /etc/nginx/conf.d/run-nginx.sh > /tmp/run-nginx.sh
+      && chmod +x /tmp/run-nginx.sh
+      && /tmp/run-nginx.sh app.conf.template.api-only"
+    deploy:
+      resources:
+        limits:
+          cpus: ${NGINX_CPU_LIMIT:-0.25}
+          memory: ${NGINX_MEM_LIMIT:-128m}
+
+  relational_db:
+    deploy:
+      resources:
+        limits:
+          cpus: ${POSTGRES_CPU_LIMIT:-1.0}
+          memory: ${POSTGRES_MEM_LIMIT:-1g}
+
+  cache:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256m
+
+  opensearch:
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - bootstrap.memory_lock=true
+      # Stock compose hardcodes 2g heap. 1g heap + 2g cgroup fits 16 GB VMs.
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g

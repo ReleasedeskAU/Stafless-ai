@@ -69,6 +69,7 @@ Add paths here when the display rebrand (or other overlay) lands.
 
 - `UPSTREAM-SYNC.md` — this document
 - `README.md` — StaffLess AI fork readme (foss regenerates theirs on every force-push)
+- `deployment/releasedesk-overlay/` — ReleaseDesk compose overlay, env template, nginx, setup script, host/checklist docs
 - `backend/onyx/configs/constants.py` — `ONYX_DEFAULT_APPLICATION_NAME` value only
 - `backend/onyx/main.py` — OpenAPI title/description
 - `backend/onyx/mcp_server/api.py` — OpenAPI title
@@ -139,9 +140,9 @@ Restore overlay files from the backup branch (repeat for each path in
 the overlay list):
 
 ```bash
-git checkout backup/pre-foss-sync-YYYY-MM-DD -- UPSTREAM-SYNC.md
+git checkout backup/pre-foss-sync-YYYY-MM-DD -- UPSTREAM-SYNC.md README.md deployment/releasedesk-overlay
 # git checkout backup/pre-foss-sync-YYYY-MM-DD -- <other overlay paths>
-git add UPSTREAM-SYNC.md
+git add UPSTREAM-SYNC.md README.md deployment/releasedesk-overlay
 git commit -m "Restore StaffLess AI overlay on onyx-foss snapshot"
 ```
 
