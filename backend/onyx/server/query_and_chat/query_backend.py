@@ -12,15 +12,16 @@ from onyx.context.search.preprocessing.access_filters import (
 from onyx.db.document_catalog import (
     breakdown_by_tag,
     list_distinct_tag_values,
+    list_documents_matching_filter,
+    list_queryable_fields,
     lookup_document_by_key,
 )
 from onyx.db.document_count import (
     DocumentCountError,
     count_indexed_documents,
+    parse_catalog_filters,
     parse_count_source,
     parse_document_key,
-    parse_filter_field,
-    parse_filter_value,
     require_filter_field,
 )
 from onyx.db.engine.sql_engine import get_session
@@ -45,6 +46,14 @@ admin_router = APIRouter(prefix="/admin")
 basic_router = APIRouter(prefix="/query")
 
 
+class CatalogFilter(BaseModel):
+    """One AND-filter clause. Extra fields are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+    filter_field: str = Field(max_length=40)
+    filter_value: str = Field(max_length=80)
+
+
 class DocumentCountRequest(BaseModel):
     """Exact unique-document count. Extra fields are rejected."""
 
@@ -52,6 +61,16 @@ class DocumentCountRequest(BaseModel):
     source: str | None = Field(default=None, max_length=40)
     filter_field: str | None = Field(default=None, max_length=40)
     filter_value: str | None = Field(default=None, max_length=80)
+    filters: list[CatalogFilter] | None = Field(default=None, max_length=5)
+
+
+def _parsed_filters(
+    filter_field: str | None,
+    filter_value: str | None,
+    filters: list[CatalogFilter] | None,
+) -> list[tuple[str, str]]:
+    raw = [(item.filter_field, item.filter_value) for item in filters] if filters else None
+    return parse_catalog_filters(filter_field, filter_value, raw)
 
 
 @admin_router.post("/document-count")
@@ -63,14 +82,13 @@ def document_count(
     """Exact unique indexed document count. Not a search-hit sample.
 
     Uses Postgres connector membership and document tags (assignee, status, …).
-    Partial filter_value matches (Kabir → Mohd Kabir).
+    Names/labels use contains; key/parent/status/dates are exact.
     """
     try:
         return count_indexed_documents(
             db_session,
             source=parse_count_source(body.source),
-            filter_field=parse_filter_field(body.filter_field),
-            filter_value=parse_filter_value(body.filter_value),
+            filters=_parsed_filters(body.filter_field, body.filter_value, body.filters),
         )
     except DocumentCountError:
         raise HTTPException(status_code=400, detail="Invalid count request") from None
@@ -90,6 +108,32 @@ class DocumentByKeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source: str | None = Field(default=None, max_length=40)
     key: str = Field(max_length=40)
+
+
+class DocumentMatchRequest(BaseModel):
+    """List indexed documents matching AND metadata filters. Extra fields rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+    source: str | None = Field(default=None, max_length=40)
+    filter_field: str | None = Field(default=None, max_length=40)
+    filter_value: str | None = Field(default=None, max_length=80)
+    filters: list[CatalogFilter] | None = Field(default=None, max_length=5)
+
+
+class DocumentFieldsRequest(BaseModel):
+    """Published queryable fields. Extra fields rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+    source: str | None = Field(default=None, max_length=40)
+
+
+@admin_router.post("/document-fields")
+def document_fields(
+    body: DocumentFieldsRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+) -> dict[str, object]:
+    """Published allow-list of queryable tag fields. Not raw tag discovery."""
+    return list_queryable_fields()
 
 
 @admin_router.post("/document-distinct")
@@ -138,6 +182,27 @@ def document_by_key(
             db_session,
             source=parse_count_source(body.source),
             key=parse_document_key(body.key),
+        )
+    except DocumentCountError:
+        raise HTTPException(status_code=400, detail="Invalid catalog request") from None
+
+
+@admin_router.post("/document-list")
+def document_list(
+    body: DocumentMatchRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Exact indexed documents matching AND tag filters, including ticket keys.
+
+    Same match rules as document-count. Not a ranked search sample.
+    """
+    try:
+        filters = _parsed_filters(body.filter_field, body.filter_value, body.filters)
+        return list_documents_matching_filter(
+            db_session,
+            source=parse_count_source(body.source),
+            filters=filters,
         )
     except DocumentCountError:
         raise HTTPException(status_code=400, detail="Invalid catalog request") from None

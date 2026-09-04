@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session
 from onyx.configs.constants import DocumentSource
 from onyx.db.models import Connector, DocumentByConnectorCredentialPair, Document__Tag, Tag
 
+# Never queryable or returned. Enforced at parse and at field projection.
+PII_TAG_KEYS = frozenset({"assignee_email", "reporter_email"})
+
 ALLOWED_TAG_KEYS = frozenset(
     {
         "assignee",
@@ -25,12 +28,23 @@ ALLOWED_TAG_KEYS = frozenset(
         "issuetype",
         "reporter",
         "key",
+        "parent",
+        "duedate",
+        "created",
+        "updated",
+        "resolution",
+        "resolution_date",
     }
 )
+CONTAINS_TAG_KEYS = frozenset({"assignee", "reporter", "labels"})
 MAX_FILTER_VALUE_CHARS = 80
 MAX_MATCHED_VALUES = 20
 MAX_DOCUMENT_KEY_CHARS = 40
 MAX_CATALOG_ROWS = 50
+MAX_AND_FILTERS = 5
+
+if not ALLOWED_TAG_KEYS.isdisjoint(PII_TAG_KEYS):
+    raise RuntimeError("PII tag keys must not be queryable")
 
 
 class DocumentCountError(ValueError):
@@ -47,6 +61,52 @@ def escape_ilike_pattern(value: str) -> str:
         Pattern fragment safe to wrap in %...% with ESCAPE '\\'.
     """
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def field_uses_contains_match(field: str) -> bool:
+    """Names and labels use contains; keys, status, dates, and parent are exact."""
+    return field in CONTAINS_TAG_KEYS
+
+
+def stored_value_matches_filter(field: str, stored: str, needle: str) -> bool:
+    """Same match rule as SQL: contains for names/labels, else case-insensitive equality.
+
+    Args:
+        field: Allow-listed tag key.
+        stored: Indexed tag_value.
+        needle: Caller filter.
+
+    Returns:
+        True when this stored value should be included for the filter.
+    """
+    hay = stored.strip()
+    want = needle.strip()
+    if not hay or not want:
+        return False
+    if field_uses_contains_match(field):
+        return want.lower() in hay.lower()
+    return hay.lower() == want.lower()
+
+
+def queryable_fields() -> dict[str, object]:
+    """Published schema for Ask — the allow-list, not raw tag discovery.
+
+    Returns:
+        Sorted field names plus which keys use contains vs exact match.
+    """
+    fields = sorted(ALLOWED_TAG_KEYS)
+    contains = sorted(CONTAINS_TAG_KEYS)
+    exact = sorted(ALLOWED_TAG_KEYS - CONTAINS_TAG_KEYS)
+    return {
+        "fields": fields,
+        "contains_match": contains,
+        "exact_match": exact,
+        "cap": MAX_CATALOG_ROWS,
+        "note": (
+            "Queryable indexed tags only. Date ranges are not supported. "
+            "Emails and other PII fields are not listed and cannot be queried."
+        ),
+    }
 
 
 def parse_count_source(source: str | None) -> DocumentSource | None:
@@ -67,12 +127,12 @@ def parse_filter_field(filter_field: str | None) -> str | None:
     """Allow-listed metadata tag key, or None for an unfiltered source total.
 
     Raises:
-        DocumentCountError: Field is not in ALLOWED_TAG_KEYS.
+        DocumentCountError: Field is PII or not in ALLOWED_TAG_KEYS.
     """
     if filter_field is None or filter_field.strip() == "":
         return None
     key = filter_field.strip().lower()
-    if key not in ALLOWED_TAG_KEYS:
+    if key in PII_TAG_KEYS or key not in ALLOWED_TAG_KEYS:
         raise DocumentCountError("Unknown filter field")
     return key
 
@@ -81,7 +141,7 @@ def require_filter_field(filter_field: str | None) -> str:
     """Allow-listed tag key; required for distinct/breakdown queries.
 
     Raises:
-        DocumentCountError: Missing or unknown field.
+        DocumentCountError: Missing, PII, or unknown field.
     """
     key = parse_filter_field(filter_field)
     if key is None:
@@ -121,59 +181,108 @@ def parse_filter_value(filter_value: str | None) -> str | None:
     return value
 
 
+def parse_catalog_filters(
+    filter_field: str | None,
+    filter_value: str | None,
+    filters: list[tuple[str, str]] | None,
+) -> list[tuple[str, str]]:
+    """Normalize a single pair or an AND list. Empty means unfiltered total.
+
+    Raises:
+        DocumentCountError: Mixed pair+list, incomplete pair, too many, or bad field.
+    """
+    has_pair = filter_field is not None or filter_value is not None
+    has_list = bool(filters)
+    if has_pair and has_list:
+        raise DocumentCountError("Send either a single filter or filters, not both")
+    if has_list:
+        if len(filters) > MAX_AND_FILTERS:
+            raise DocumentCountError("Too many filters")
+        parsed: list[tuple[str, str]] = []
+        for raw_field, raw_value in filters:
+            field = require_filter_field(raw_field)
+            value = parse_filter_value(raw_value)
+            if value is None:
+                raise DocumentCountError("Filter value is empty")
+            parsed.append((field, value))
+        return parsed
+    if (filter_field is None) != (filter_value is None):
+        raise DocumentCountError("filter_field and filter_value must be sent together")
+    if filter_field is None:
+        return []
+    value = parse_filter_value(filter_value)
+    if value is None:
+        raise DocumentCountError("Filter value is empty")
+    return [(require_filter_field(filter_field), value)]
+
+
 def count_indexed_documents(
     db_session: Session,
     *,
     source: DocumentSource | None,
-    filter_field: str | None,
-    filter_value: str | None,
+    filters: list[tuple[str, str]],
 ) -> dict[str, object]:
-    """Exact unique indexed document count, optionally filtered by a metadata tag.
+    """Exact unique indexed document count, optionally AND-filtered by tags.
 
-    Unfiltered counts use connector membership (has_been_indexed). Filtered
-    counts use document__tag with case-insensitive contains on tag_value.
+    Unfiltered counts use connector membership (has_been_indexed). Names/labels
+    use contains; key/parent/status/dates use case-insensitive equality.
 
     Args:
         db_session: Tenant DB session.
         source: Restrict to this DocumentSource, or all sources.
-        filter_field: Allow-listed tag key, or None.
-        filter_value: Substring to match (e.g. Kabir matches Mohd Kabir).
+        filters: Allow-listed field/value pairs combined with AND.
 
     Returns:
-        count, source, filter fields, and matched tag values (capped).
+        count, source, filters with matched values, truncated-style caps.
 
     Raises:
-        DocumentCountError: filter_field set without filter_value or vice versa.
+        DocumentCountError: Invalid filter arguments.
     """
-    if (filter_field is None) != (filter_value is None):
-        raise DocumentCountError("filter_field and filter_value must be sent together")
-
-    if filter_field is None:
+    if not filters:
         count = _count_indexed_by_source(db_session, source)
-        return _result(count, source, None, None, [])
+        return _count_payload(count, source, [])
 
-    matched = _matching_tag_values(db_session, source, filter_field, filter_value)
-    if not matched:
-        return _result(0, source, filter_field, filter_value, [])
-    count = _count_docs_for_tag_values(db_session, source, filter_field, matched)
-    return _result(count, source, filter_field, filter_value, matched[:MAX_MATCHED_VALUES])
+    resolved = _resolve_filters(db_session, source, filters)
+    if any(not item["matched_values"] for item in resolved):
+        return _count_payload(0, source, resolved)
+    specs = [(item["filter_field"], item["matched_values"]) for item in resolved]
+    count = _count_docs_matching_and(db_session, source, specs)
+    return _count_payload(count, source, resolved)
 
 
-def _result(
+def _count_payload(
     count: int,
     source: DocumentSource | None,
-    filter_field: str | None,
-    filter_value: str | None,
-    matched_values: list[str],
+    resolved: list[dict[str, object]],
 ) -> dict[str, object]:
+    first = resolved[0] if resolved else None
     return {
         "count": count,
         "source": source.value if source else "all",
-        "filter_field": filter_field,
-        "filter_value": filter_value,
-        "matched_values": matched_values,
+        "filters": resolved,
+        "filter_field": first["filter_field"] if first else None,
+        "filter_value": first["filter_value"] if first else None,
+        "matched_values": first["matched_values"] if first else [],
         "note": "Exact unique indexed document count, not a search sample.",
     }
+
+
+def _resolve_filters(
+    db_session: Session,
+    source: DocumentSource | None,
+    filters: list[tuple[str, str]],
+) -> list[dict[str, object]]:
+    resolved: list[dict[str, object]] = []
+    for field, value in filters:
+        matched = _matching_tag_values(db_session, source, field, value)
+        resolved.append(
+            {
+                "filter_field": field,
+                "filter_value": value,
+                "matched_values": matched[:MAX_MATCHED_VALUES],
+            }
+        )
+    return resolved
 
 
 def _count_indexed_by_source(db_session: Session, source: DocumentSource | None) -> int:
@@ -188,17 +297,23 @@ def _count_indexed_by_source(db_session: Session, source: DocumentSource | None)
     return int(db_session.execute(stmt).scalar_one())
 
 
+def _tag_value_clause(filter_field: str, filter_value: str):
+    if field_uses_contains_match(filter_field):
+        pattern = f"%{escape_ilike_pattern(filter_value)}%"
+        return Tag.tag_value.ilike(pattern, escape="\\")
+    return func.lower(Tag.tag_value) == filter_value.lower()
+
+
 def _matching_tag_values(
     db_session: Session,
     source: DocumentSource | None,
     filter_field: str,
     filter_value: str,
 ) -> list[str]:
-    pattern = f"%{escape_ilike_pattern(filter_value)}%"
     stmt = (
         select(Tag.tag_value)
         .where(Tag.tag_key == filter_field)
-        .where(Tag.tag_value.ilike(pattern, escape="\\"))
+        .where(_tag_value_clause(filter_field, filter_value))
         .distinct()
         .limit(MAX_MATCHED_VALUES + 1)
     )
@@ -207,14 +322,14 @@ def _matching_tag_values(
     return list(db_session.execute(stmt).scalars().all())
 
 
-def _count_docs_for_tag_values(
+def _indexed_doc_ids_for_values(
     db_session: Session,
     source: DocumentSource | None,
     filter_field: str,
     tag_values: list[str],
-) -> int:
+) -> set[str]:
     stmt = (
-        select(func.count(distinct(Document__Tag.document_id)))
+        select(Document__Tag.document_id)
         .select_from(Document__Tag)
         .join(Tag, Tag.id == Document__Tag.tag_id)
         .join(
@@ -224,7 +339,40 @@ def _count_docs_for_tag_values(
         .where(DocumentByConnectorCredentialPair.has_been_indexed.is_(True))
         .where(Tag.tag_key == filter_field)
         .where(Tag.tag_value.in_(tag_values))
+        .distinct()
     )
     if source is not None:
         stmt = stmt.where(Tag.source == source)
-    return int(db_session.execute(stmt).scalar_one())
+    return {str(doc_id) for doc_id in db_session.execute(stmt).scalars().all()}
+
+
+def _count_docs_matching_and(
+    db_session: Session,
+    source: DocumentSource | None,
+    specs: list[tuple[str, list[str]]],
+) -> int:
+    ids = _intersect_doc_ids(db_session, source, specs)
+    return len(ids)
+
+
+def _intersect_doc_ids(
+    db_session: Session,
+    source: DocumentSource | None,
+    specs: list[tuple[str, list[str]]],
+) -> set[str]:
+    ids: set[str] | None = None
+    for field, values in specs:
+        part = _indexed_doc_ids_for_values(db_session, source, field, values)
+        ids = part if ids is None else ids & part
+        if not ids:
+            return set()
+    return ids or set()
+
+
+def matching_document_ids(
+    db_session: Session,
+    source: DocumentSource | None,
+    specs: list[tuple[str, list[str]]],
+) -> list[str]:
+    """AND-intersection of indexed document ids, ordered."""
+    return sorted(_intersect_doc_ids(db_session, source, specs))

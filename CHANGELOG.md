@@ -12,3 +12,8 @@
 - Jira comments are fully paginated, ADF mentions/status/emoji/links become
   readable text, title/description/comments are read from the issue payload
   independently, and Jira 429s retry with Retry-After / backoff.
+- Ask can list exact ticket keys for a filter (label, assignee, status, …).
+  Counts no longer strand the model without IDs.
+- Catalog queries use a published field allow-list (including parent and
+  duedate). Names use contains; key/parent/status/dates are exact. Find/count
+  support AND filters. Email tags are never queryable or returned.

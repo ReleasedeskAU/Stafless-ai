@@ -2,13 +2,19 @@
 
 from onyx.configs.constants import DocumentSource
 from onyx.db.document_count import (
+    ALLOWED_TAG_KEYS,
     DocumentCountError,
+    PII_TAG_KEYS,
     escape_ilike_pattern,
+    field_uses_contains_match,
+    parse_catalog_filters,
     parse_count_source,
     parse_document_key,
     parse_filter_field,
     parse_filter_value,
+    queryable_fields,
     require_filter_field,
+    stored_value_matches_filter,
 )
 import pytest
 
@@ -62,4 +68,46 @@ def test_parse_document_key_exact_not_contains() -> None:
         parse_document_key("RD-82\n")
     with pytest.raises(DocumentCountError):
         parse_document_key("x" * 41)
+
+
+def test_pii_fields_are_never_queryable() -> None:
+    assert ALLOWED_TAG_KEYS.isdisjoint(PII_TAG_KEYS)
+    schema = queryable_fields()
+    fields = schema["fields"]
+    assert isinstance(fields, list)
+    for blocked in PII_TAG_KEYS:
+        assert blocked not in fields
+        with pytest.raises(DocumentCountError):
+            parse_filter_field(blocked)
+    assert "parent" in fields
+    assert "duedate" in fields
+
+
+def test_key_and_parent_are_exact_not_contains() -> None:
+    assert field_uses_contains_match("parent") is False
+    assert field_uses_contains_match("key") is False
+    assert stored_value_matches_filter("parent", "RD-90", "RD-90") is True
+    assert stored_value_matches_filter("parent", "RD-90", "rd-90") is True
+    assert stored_value_matches_filter("parent", "RD-90", "RD-9") is False
+    assert stored_value_matches_filter("key", "RD-90", "RD-9") is False
+
+
+def test_names_and_labels_keep_contains_match() -> None:
+    assert stored_value_matches_filter("assignee", "Mohd Kabir", "Kabir") is True
+    assert stored_value_matches_filter("labels", "release123", "release") is True
+    assert stored_value_matches_filter("status", "To Do", "todo") is False
+    assert stored_value_matches_filter("status", "To Do", "To Do") is True
+
+
+def test_and_filters_parse_and_reject_mix() -> None:
+    assert parse_catalog_filters("status", "To Do", None) == [("status", "To Do")]
+    assert parse_catalog_filters(
+        None, None, [("issuetype", "Bug"), ("assignee", "Kabir")]
+    ) == [("issuetype", "Bug"), ("assignee", "Kabir")]
+    with pytest.raises(DocumentCountError):
+        parse_catalog_filters("status", "To Do", [("assignee", "Kabir")])
+    with pytest.raises(DocumentCountError):
+        parse_catalog_filters("assignee_email", "a@b.c", None)
+    with pytest.raises(DocumentCountError):
+        parse_catalog_filters(None, None, [("status", "To Do")] * 6)
 

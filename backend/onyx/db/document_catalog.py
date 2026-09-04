@@ -1,7 +1,8 @@
 """Exact catalog queries on indexed Postgres tags — not OpenSearch top-N search.
 
-Distinct values, group-by counts, and key lookup share the same unique-document
-census as document_count. Tags are the source of truth; doc_metadata is unused.
+Distinct values, group-by counts, key lookup, and filter lists share the same
+unique-document census as document_count. Tags are the source of truth;
+doc_metadata is unused.
 """
 
 from __future__ import annotations
@@ -12,13 +13,33 @@ from sqlalchemy.orm import Session
 from onyx.configs.constants import DocumentSource
 from onyx.db.document_count import (
     ALLOWED_TAG_KEYS,
+    DocumentCountError,
     MAX_CATALOG_ROWS,
+    MAX_DOCUMENT_KEY_CHARS,
+    PII_TAG_KEYS,
     _count_indexed_by_source,
+    _resolve_filters,
     escape_ilike_pattern,
+    matching_document_ids,
+    queryable_fields,
 )
 from onyx.db.models import Connector, Document, DocumentByConnectorCredentialPair, Document__Tag, Tag
 
 KEY_TAG = "key"
+
+
+def ticket_key_from_semantic_id(semantic_id: str | None) -> str | None:
+    """Best-effort ticket key from `RD-82: title` or `RD-82 title` semantic ids."""
+    if not semantic_id:
+        return None
+    trimmed = semantic_id.strip()
+    for sep in (": ", " "):
+        if sep not in trimmed:
+            continue
+        prefix = trimmed.split(sep, 1)[0].strip()
+        if prefix and len(prefix) <= MAX_DOCUMENT_KEY_CHARS:
+            return prefix
+    return None
 
 
 def list_distinct_tag_values(
@@ -86,6 +107,43 @@ def breakdown_by_tag(
     }
 
 
+def list_documents_matching_filter(
+    db_session: Session,
+    *,
+    source: DocumentSource | None,
+    filters: list[tuple[str, str]],
+) -> dict[str, object]:
+    """Exact indexed documents matching AND tag filters, with ticket keys.
+
+    Same match rules as document-count. Results are capped; count is the full
+    unique-document total so callers can say first 50 of N.
+
+    Args:
+        db_session: Tenant DB session.
+        source: Restrict to this DocumentSource, or all sources.
+        filters: Allow-listed field/value pairs combined with AND.
+
+    Returns:
+        count, documents[{key, title, link}], filters, truncated, cap.
+
+    Raises:
+        DocumentCountError: Empty filters.
+    """
+    if not filters:
+        raise DocumentCountError("At least one filter is required")
+    resolved = _resolve_filters(db_session, source, filters)
+    if any(not item["matched_values"] for item in resolved):
+        return _matching_list_payload([], 0, source, resolved, truncated=False)
+    specs = [(str(item["filter_field"]), list(item["matched_values"])) for item in resolved]
+    doc_ids = matching_document_ids(db_session, source, specs)
+    true_count = len(doc_ids)
+    truncated = true_count > MAX_CATALOG_ROWS
+    documents = _documents_with_keys(db_session, doc_ids[:MAX_CATALOG_ROWS])
+    return _matching_list_payload(
+        documents, true_count, source, resolved, truncated=truncated
+    )
+
+
 def lookup_document_by_key(
     db_session: Session,
     *,
@@ -123,6 +181,83 @@ def lookup_document_by_key(
         "fields": _allowlisted_fields(db_session, doc.id),
         "note": "Exact indexed document lookup by key, not a search ranking.",
     }
+
+
+def list_queryable_fields() -> dict[str, object]:
+    """Published allow-list for Ask. Does not scan stored tag keys."""
+    return queryable_fields()
+
+
+def catalog_document_row(
+    *,
+    key: str | None,
+    semantic_id: str | None,
+    link: str | None,
+) -> dict[str, str | None]:
+    """One list-result document. Key tag wins; semantic_id prefix is the fallback."""
+    resolved = (key or "").strip() or ticket_key_from_semantic_id(semantic_id)
+    return {
+        "key": resolved,
+        "title": (semantic_id or "").strip() or resolved,
+        "link": link,
+    }
+
+
+def _matching_list_payload(
+    documents: list[dict[str, str | None]],
+    count: int,
+    source: DocumentSource | None,
+    resolved: list[dict[str, object]],
+    *,
+    truncated: bool,
+) -> dict[str, object]:
+    first = resolved[0] if resolved else None
+    return {
+        "count": count,
+        "returned": len(documents),
+        "cap": MAX_CATALOG_ROWS,
+        "source": source.value if source else "all",
+        "filters": resolved,
+        "filter_field": first["filter_field"] if first else None,
+        "filter_value": first["filter_value"] if first else None,
+        "matched_values": first["matched_values"] if first else [],
+        "documents": documents,
+        "truncated": truncated,
+        "note": (
+            f"Showing first {len(documents)} of {count} matching indexed documents."
+            if truncated
+            else "Exact indexed documents matching this filter, not a search sample."
+        ),
+    }
+
+
+def _documents_with_keys(
+    db_session: Session, doc_ids: list[str]
+) -> list[dict[str, str | None]]:
+    if not doc_ids:
+        return []
+    docs = {
+        str(row.id): row
+        for row in db_session.execute(select(Document).where(Document.id.in_(doc_ids))).scalars()
+    }
+    key_rows = db_session.execute(
+        select(Document__Tag.document_id, Tag.tag_value)
+        .join(Tag, Tag.id == Document__Tag.tag_id)
+        .where(Document__Tag.document_id.in_(doc_ids))
+        .where(Tag.tag_key == KEY_TAG)
+    ).all()
+    keys = {str(doc_id): str(value) for doc_id, value in key_rows}
+    rows = [
+        catalog_document_row(
+            key=keys.get(doc_id),
+            semantic_id=docs[doc_id].semantic_id,
+            link=docs[doc_id].link,
+        )
+        for doc_id in doc_ids
+        if doc_id in docs
+    ]
+    rows.sort(key=lambda row: (row.get("key") or "", row.get("title") or ""))
+    return rows
 
 
 def _group_counts(
@@ -227,6 +362,8 @@ def _allowlisted_fields(db_session: Session, document_id: str) -> dict[str, str 
     )
     fields: dict[str, str | list[str]] = {}
     for tag_key, tag_value, is_list in db_session.execute(stmt):
+        if tag_key in PII_TAG_KEYS or tag_key not in ALLOWED_TAG_KEYS:
+            continue
         _append_field(fields, tag_key, tag_value, bool(is_list))
     return fields
 
