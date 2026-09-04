@@ -65,11 +65,15 @@ services:
       - MODEL_SERVER_HOST=disabled
       - INDEXING_MODEL_SERVER_HOST=disabled
       - FILE_STORE_BACKEND=${FILE_STORE_BACKEND:-postgres}
+      # 6 docprocessing workers * INDEX_BATCH_SIZE 16 OOMs a 2g cgroup (celery
+      # MEMCG kills). Keep peak RSS inside BACKGROUND_MEM_LIMIT on D4as_v5.
+      - INDEX_BATCH_SIZE=${INDEX_BATCH_SIZE:-4}
+      - CELERY_WORKER_DOCPROCESSING_CONCURRENCY=${CELERY_WORKER_DOCPROCESSING_CONCURRENCY:-2}
     deploy:
       resources:
         limits:
           cpus: ${BACKGROUND_CPU_LIMIT:-1.5}
-          memory: ${BACKGROUND_MEM_LIMIT:-2g}
+          memory: ${BACKGROUND_MEM_LIMIT:-4g}
 
   nginx:
     # Stock compose hard-requires web_server healthy or nginx never starts.

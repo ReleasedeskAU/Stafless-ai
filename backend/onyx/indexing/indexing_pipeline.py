@@ -211,14 +211,45 @@ def _upsert_documents_in_db(
 
     upsert_documents(db_session, document_metadata_list)
 
+    persisted_by_field: dict[str, int] = {}
+    expected_by_field: dict[str, int] = {}
+
     # Insert document content metadata
     for doc in documents:
-        upsert_document_tags(
+        persisted_tags = upsert_document_tags(
             document_id=doc.id,
             source=doc.source,
             metadata=doc.metadata,
             db_session=db_session,
         )
+        persisted_pairs = {(tag.tag_key, tag.tag_value) for tag in persisted_tags}
+        missing_fields: set[str] = set()
+        for key, value in doc.metadata.items():
+            values = value if isinstance(value, list) else [value]
+            if not values:
+                continue
+            expected_by_field[key] = expected_by_field.get(key, 0) + 1
+            if all((key, item) in persisted_pairs for item in values):
+                persisted_by_field[key] = persisted_by_field.get(key, 0) + 1
+            else:
+                missing_fields.add(key)
+        if missing_fields:
+            # Values may contain PII, so identify only the document and field names.
+            logger.error(
+                "Document %s lost metadata while persisting tags: fields=%s",
+                doc.id,
+                sorted(missing_fields),
+            )
+
+    completeness = " ".join(
+        f"{key}={persisted_by_field.get(key, 0)}/{expected}"
+        for key, expected in sorted(expected_by_field.items())
+    )
+    logger.notice(
+        "Document tag persistence summary: records_stored=%s field_completeness=[%s]",
+        len(documents),
+        completeness,
+    )
 
 
 def _get_failed_doc_ids(failures: list[ConnectorFailure]) -> set[str]:

@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
@@ -7,6 +8,20 @@ from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import IndexFilters, SearchDoc
 from onyx.context.search.preprocessing.access_filters import (
     build_access_filters_for_user,
+)
+from onyx.db.document_catalog import (
+    breakdown_by_tag,
+    list_distinct_tag_values,
+    lookup_document_by_key,
+)
+from onyx.db.document_count import (
+    DocumentCountError,
+    count_indexed_documents,
+    parse_count_source,
+    parse_document_key,
+    parse_filter_field,
+    parse_filter_value,
+    require_filter_field,
 )
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
@@ -28,6 +43,104 @@ logger = setup_logger()
 
 admin_router = APIRouter(prefix="/admin")
 basic_router = APIRouter(prefix="/query")
+
+
+class DocumentCountRequest(BaseModel):
+    """Exact unique-document count. Extra fields are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+    source: str | None = Field(default=None, max_length=40)
+    filter_field: str | None = Field(default=None, max_length=40)
+    filter_value: str | None = Field(default=None, max_length=80)
+
+
+@admin_router.post("/document-count")
+def document_count(
+    body: DocumentCountRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Exact unique indexed document count. Not a search-hit sample.
+
+    Uses Postgres connector membership and document tags (assignee, status, …).
+    Partial filter_value matches (Kabir → Mohd Kabir).
+    """
+    try:
+        return count_indexed_documents(
+            db_session,
+            source=parse_count_source(body.source),
+            filter_field=parse_filter_field(body.filter_field),
+            filter_value=parse_filter_value(body.filter_value),
+        )
+    except DocumentCountError:
+        raise HTTPException(status_code=400, detail="Invalid count request") from None
+
+
+class DocumentFieldRequest(BaseModel):
+    """Distinct values or group-by for one metadata field. Extra fields rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+    source: str | None = Field(default=None, max_length=40)
+    field: str = Field(max_length=40)
+
+
+class DocumentByKeyRequest(BaseModel):
+    """Exact document lookup by ticket/document key. Extra fields rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+    source: str | None = Field(default=None, max_length=40)
+    key: str = Field(max_length=40)
+
+
+@admin_router.post("/document-distinct")
+def document_distinct(
+    body: DocumentFieldRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Exact distinct tag values for one field on indexed documents."""
+    try:
+        return list_distinct_tag_values(
+            db_session,
+            source=parse_count_source(body.source),
+            filter_field=require_filter_field(body.field),
+        )
+    except DocumentCountError:
+        raise HTTPException(status_code=400, detail="Invalid catalog request") from None
+
+
+@admin_router.post("/document-breakdown")
+def document_breakdown(
+    body: DocumentFieldRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Exact unique-document counts grouped by one metadata field."""
+    try:
+        return breakdown_by_tag(
+            db_session,
+            source=parse_count_source(body.source),
+            filter_field=require_filter_field(body.field),
+        )
+    except DocumentCountError:
+        raise HTTPException(status_code=400, detail="Invalid catalog request") from None
+
+
+@admin_router.post("/document-by-key")
+def document_by_key(
+    body: DocumentByKeyRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Exact indexed document lookup by ticket key (not ranked search)."""
+    try:
+        return lookup_document_by_key(
+            db_session,
+            source=parse_count_source(body.source),
+            key=parse_document_key(body.key),
+        )
+    except DocumentCountError:
+        raise HTTPException(status_code=400, detail="Invalid catalog request") from None
 
 
 @admin_router.post("/search", dependencies=[Depends(require_vector_db)])

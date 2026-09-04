@@ -41,6 +41,17 @@ def test_bulk_fetch_success() -> None:
     client._session.post.assert_called_once()
 
 
+def test_bulk_fetch_rejects_silent_partial_response() -> None:
+    """A successful HTTP response must still contain every requested issue."""
+    client = _mock_jira_client()
+    resp = MagicMock()
+    resp.json.return_value = {"issues": [_make_raw_issue("1")]}
+    client._session.post.return_value = resp
+
+    with pytest.raises(RuntimeError, match="omitted 1 requested issue"):
+        bulk_fetch_issues(client, ["1", "2"])
+
+
 def test_bulk_fetch_splits_on_json_error() -> None:
     """When the full batch fails with JSONDecodeError, sub-batches succeed."""
     client = _mock_jira_client()

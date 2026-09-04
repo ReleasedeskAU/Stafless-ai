@@ -40,14 +40,23 @@ from onyx.connectors.interfaces import (
 from onyx.connectors.jira.access import get_project_permissions
 from onyx.connectors.jira.utils import (
     JIRA_CLOUD_API_VERSION,
-    best_effort_basic_expert_info,
+    JiraFieldStats,
     best_effort_get_field_from_issue,
     build_jira_client,
     build_jira_url,
-    extract_text_from_adf,
     get_comment_strs,
+    jira_issue_key,
+    jira_issue_plain_field,
+    jira_key_value,
+    jira_label_values,
+    jira_named_value,
+    jira_sdk_call,
+    jira_session_request,
+    jira_user_display_name,
+    jira_user_email,
 )
 from onyx.connectors.models import (
+    BasicExpertInfo,
     ConnectorCheckpoint,
     ConnectorFailure,
     ConnectorMissingCredentialError,
@@ -235,10 +244,12 @@ def enhanced_search_ids(
         "fields": "id",
     }
     try:
-        response = jira_client._session.get(  # ty: ignore[unresolved-attribute]
-            enhanced_search_path, params=params
+        response = jira_session_request(
+            jira_client._session,
+            "get",
+            enhanced_search_path,
+            params=params,
         )
-        response.raise_for_status()
         response_json = response.json()
     except Exception as e:
         _handle_jira_search_error(e, jql)
@@ -260,10 +271,20 @@ def _bulk_fetch_request(
     # to avoid reading unnecessary data
     payload["fields"] = fields.split(",") if fields else ["*all"]
 
-    resp = jira_client._session.post(  # ty: ignore[unresolved-attribute]
-        bulk_fetch_path, json=payload
+    resp = jira_session_request(
+        jira_client._session,
+        "post",
+        bulk_fetch_path,
+        json=payload,
     )
-    return resp.json()["issues"]
+    issues = resp.json()["issues"]
+    returned_ids = {str(issue.get("id")) for issue in issues}
+    missing_ids = set(issue_ids) - returned_ids
+    if missing_ids:
+        raise RuntimeError(
+            f"Jira bulk fetch omitted {len(missing_ids)} requested issue(s)"
+        )
+    return issues
 
 
 def _bulk_fetch_batch(
@@ -372,7 +393,8 @@ def _perform_jql_search_v2(
         max_results,
     )
     try:
-        issues = jira_client.search_issues(
+        issues = jira_sdk_call(
+            jira_client.search_issues,
             jql_str=jql,
             startAt=start,
             maxResults=max_results,
@@ -389,110 +411,283 @@ def _perform_jql_search_v2(
             raise RuntimeError(f"Found Jira object not of type Issue: {issue}")
 
 
+def _put_user_metadata(
+    metadata: dict[str, str | list[str]],
+    people: set[Any],
+    stats: JiraFieldStats | None,
+    issue_key: str,
+    field_name: str,
+    email_field: str,
+    payload: Any,
+) -> None:
+    """Tag assignee/reporter from displayName. Email is optional and independent."""
+    present = payload is not None
+    name = jira_user_display_name(payload) if present else None
+    email = jira_user_email(payload) if present else None
+    tagged = False
+    reason: str | None = None
+    if name:
+        metadata[field_name] = name
+        tagged = True
+        people.add(BasicExpertInfo(display_name=name, email=email))
+    elif present:
+        reason = "no displayName on user payload"
+    if email:
+        metadata[email_field] = email
+    if stats is not None:
+        stats.observe(
+            field_name,
+            present=present,
+            tagged=tagged,
+            issue_key=issue_key,
+            reason=reason,
+        )
+        stats.observe(
+            email_field,
+            present=email is not None,
+            tagged=email_field in metadata,
+            issue_key=issue_key,
+        )
+
+
+def _put_named_metadata(
+    metadata: dict[str, str | list[str]],
+    stats: JiraFieldStats | None,
+    issue_key: str,
+    field_name: str,
+    payload: Any,
+) -> None:
+    """Tag status/priority/issuetype from a named Jira object or dict."""
+    present = payload is not None
+    value = jira_named_value(payload) if present else None
+    if value:
+        metadata[field_name] = value
+    if stats is not None:
+        stats.observe(
+            field_name,
+            present=present,
+            tagged=bool(value),
+            issue_key=issue_key,
+            reason="missing name" if present and not value else None,
+        )
+
+
+def _build_jira_metadata(
+    issue: Issue,
+    stats: JiraFieldStats | None,
+) -> tuple[dict[str, str | list[str]], set[Any]]:
+    """Build searchable tags from one issue. Never depends on Resource lazy-loads."""
+    issue_key = getattr(issue, "key", None) or jira_key_value(issue) or "unknown"
+    metadata: dict[str, str | list[str]] = {}
+    people: set[Any] = set()
+    metadata[_FIELD_KEY] = str(issue_key)
+    if stats is not None:
+        stats.observe("key", present=True, tagged=True, issue_key=str(issue_key))
+
+    _put_user_metadata(
+        metadata,
+        people,
+        stats,
+        str(issue_key),
+        _FIELD_REPORTER,
+        _FIELD_REPORTER_EMAIL,
+        best_effort_get_field_from_issue(issue, _FIELD_REPORTER),
+    )
+    _put_user_metadata(
+        metadata,
+        people,
+        stats,
+        str(issue_key),
+        _FIELD_ASSIGNEE,
+        _FIELD_ASSIGNEE_EMAIL,
+        best_effort_get_field_from_issue(issue, _FIELD_ASSIGNEE),
+    )
+    _put_named_metadata(
+        metadata,
+        stats,
+        str(issue_key),
+        _FIELD_PRIORITY,
+        best_effort_get_field_from_issue(issue, _FIELD_PRIORITY),
+    )
+    _put_named_metadata(
+        metadata,
+        stats,
+        str(issue_key),
+        _FIELD_STATUS,
+        best_effort_get_field_from_issue(issue, _FIELD_STATUS),
+    )
+    _put_named_metadata(
+        metadata,
+        stats,
+        str(issue_key),
+        _FIELD_RESOLUTION,
+        best_effort_get_field_from_issue(issue, _FIELD_RESOLUTION),
+    )
+    _put_named_metadata(
+        metadata,
+        stats,
+        str(issue_key),
+        _FIELD_ISSUETYPE,
+        best_effort_get_field_from_issue(issue, _FIELD_ISSUETYPE),
+    )
+
+    labels_payload = best_effort_get_field_from_issue(issue, _FIELD_LABELS)
+    labels = jira_label_values(labels_payload)
+    if labels:
+        metadata[_FIELD_LABELS] = labels
+    if stats is not None:
+        stats.observe(
+            _FIELD_LABELS,
+            present=bool(labels_payload),
+            tagged=bool(labels),
+            issue_key=str(issue_key),
+            reason="unusable label entries" if labels_payload and not labels else None,
+        )
+
+    for time_field in (
+        _FIELD_CREATED,
+        _FIELD_UPDATED,
+        _FIELD_DUEDATE,
+        _FIELD_RESOLUTION_DATE,
+    ):
+        raw_time = best_effort_get_field_from_issue(issue, time_field)
+        meta_key = (
+            _FIELD_RESOLUTION_DATE_KEY
+            if time_field == _FIELD_RESOLUTION_DATE
+            else time_field
+        )
+        if raw_time is not None:
+            metadata[meta_key] = (
+                raw_time if isinstance(raw_time, str) else str(raw_time)
+            )
+        if stats is not None:
+            stats.observe(
+                meta_key,
+                present=raw_time is not None,
+                tagged=meta_key in metadata,
+                issue_key=str(issue_key),
+            )
+
+    parent = best_effort_get_field_from_issue(issue, _FIELD_PARENT)
+    parent_key = jira_key_value(parent) if parent is not None else None
+    if parent_key:
+        metadata[_FIELD_PARENT] = parent_key
+    if stats is not None:
+        stats.observe(
+            _FIELD_PARENT,
+            present=parent is not None,
+            tagged=bool(parent_key),
+            issue_key=str(issue_key),
+            reason="missing parent key"
+            if parent is not None and not parent_key
+            else None,
+        )
+
+    project = best_effort_get_field_from_issue(issue, _FIELD_PROJECT)
+    project_key = jira_key_value(project) if project is not None else None
+    project_name = jira_named_value(project) if project is not None else None
+    if project_name:
+        metadata[_FIELD_PROJECT_NAME] = project_name
+    if project_key:
+        metadata[_FIELD_PROJECT] = project_key
+    elif project is not None:
+        logger.error("Project should exist but has no key for %s", issue_key)
+    if stats is not None:
+        stats.observe(
+            _FIELD_PROJECT,
+            present=project is not None,
+            tagged=bool(project_key),
+            issue_key=str(issue_key),
+            reason="missing project key"
+            if project is not None and not project_key
+            else None,
+        )
+        stats.observe(
+            _FIELD_PROJECT_NAME,
+            present=project is not None and project_name is not None,
+            tagged=bool(project_name),
+            issue_key=str(issue_key),
+        )
+    return metadata, people
+
+
 def process_jira_issue(
     jira_base_url: str,
     issue: Issue,
     comment_email_blacklist: tuple[str, ...] = (),
     labels_to_skip: set[str] | None = None,
     parent_hierarchy_raw_node_id: str | None = None,
+    field_stats: JiraFieldStats | None = None,
+    jira_client: JIRA | None = None,
 ) -> Document | None:
+    issue_key = jira_issue_key(issue)
     if labels_to_skip:
-        if any(label in issue.fields.labels for label in labels_to_skip):
+        issue_labels = jira_label_values(
+            best_effort_get_field_from_issue(issue, _FIELD_LABELS)
+        )
+        if any(label in labels_to_skip for label in issue_labels):
             logger.info(
                 "Skipping %s because it has a label to skip. Found labels: %s. Labels to skip: %s.",
-                issue.key,
-                issue.fields.labels,
+                issue_key,
+                issue_labels,
                 labels_to_skip,
             )
+            if field_stats is not None:
+                field_stats.issues_skipped_label += 1
             return None
 
-    if isinstance(issue.fields.description, str):
-        description = issue.fields.description
-    else:
-        description = extract_text_from_adf(issue.raw["fields"]["description"])
+    description = ""
+    try:
+        description = jira_issue_plain_field(issue, "description")
+    except Exception:
+        logger.exception("Failed reading description for %s", issue_key)
 
-    comments = get_comment_strs(
-        issue=issue,
-        comment_email_blacklist=comment_email_blacklist,
-    )
+    comments: list[str] = []
+    try:
+        comments = get_comment_strs(
+            issue=issue,
+            comment_email_blacklist=comment_email_blacklist,
+            jira_client=jira_client,
+        )
+    except RuntimeError:
+        raise
+    except Exception:
+        logger.exception("Failed reading comments for %s", issue_key)
+
     ticket_content = f"{description}\n" + "\n".join(
         [f"Comment: {comment}" for comment in comments if comment]
     )
 
-    # Check ticket size
     if len(ticket_content.encode("utf-8")) > JIRA_CONNECTOR_MAX_TICKET_SIZE:
         logger.info(
             "Skipping %s because it exceeds the maximum size of %s bytes.",
-            issue.key,
+            issue_key,
             JIRA_CONNECTOR_MAX_TICKET_SIZE,
         )
+        if field_stats is not None:
+            field_stats.issues_skipped_size += 1
         return None
 
-    page_url = build_jira_url(jira_base_url, issue.key)
-
-    metadata_dict: dict[str, str | list[str]] = {}
-    people = set()
-
-    creator = best_effort_get_field_from_issue(issue, _FIELD_REPORTER)
-    if creator is not None and (
-        basic_expert_info := best_effort_basic_expert_info(creator)
-    ):
-        people.add(basic_expert_info)
-        metadata_dict[_FIELD_REPORTER] = basic_expert_info.get_semantic_name()
-        if email := basic_expert_info.get_email():
-            metadata_dict[_FIELD_REPORTER_EMAIL] = email
-
-    assignee = best_effort_get_field_from_issue(issue, _FIELD_ASSIGNEE)
-    if assignee is not None and (
-        basic_expert_info := best_effort_basic_expert_info(assignee)
-    ):
-        people.add(basic_expert_info)
-        metadata_dict[_FIELD_ASSIGNEE] = basic_expert_info.get_semantic_name()
-        if email := basic_expert_info.get_email():
-            metadata_dict[_FIELD_ASSIGNEE_EMAIL] = email
-
-    metadata_dict[_FIELD_KEY] = issue.key
-    if priority := best_effort_get_field_from_issue(issue, _FIELD_PRIORITY):
-        metadata_dict[_FIELD_PRIORITY] = priority.name
-    if status := best_effort_get_field_from_issue(issue, _FIELD_STATUS):
-        metadata_dict[_FIELD_STATUS] = status.name
-    if resolution := best_effort_get_field_from_issue(issue, _FIELD_RESOLUTION):
-        metadata_dict[_FIELD_RESOLUTION] = resolution.name
-    if labels := best_effort_get_field_from_issue(issue, _FIELD_LABELS):
-        metadata_dict[_FIELD_LABELS] = labels
-    if created := best_effort_get_field_from_issue(issue, _FIELD_CREATED):
-        metadata_dict[_FIELD_CREATED] = created
-    if updated := best_effort_get_field_from_issue(issue, _FIELD_UPDATED):
-        metadata_dict[_FIELD_UPDATED] = updated
-    if duedate := best_effort_get_field_from_issue(issue, _FIELD_DUEDATE):
-        metadata_dict[_FIELD_DUEDATE] = duedate
-    if issuetype := best_effort_get_field_from_issue(issue, _FIELD_ISSUETYPE):
-        metadata_dict[_FIELD_ISSUETYPE] = issuetype.name
-    if resolutiondate := best_effort_get_field_from_issue(
-        issue, _FIELD_RESOLUTION_DATE
-    ):
-        metadata_dict[_FIELD_RESOLUTION_DATE_KEY] = resolutiondate
-
-    parent = best_effort_get_field_from_issue(issue, _FIELD_PARENT)
-    if parent is not None:
-        metadata_dict[_FIELD_PARENT] = parent.key
-
-    project = best_effort_get_field_from_issue(issue, _FIELD_PROJECT)
-    if project is not None:
-        metadata_dict[_FIELD_PROJECT_NAME] = project.name
-        metadata_dict[_FIELD_PROJECT] = project.key
-    else:
-        logger.error("Project should exist but does not for %s", issue.key)
+    summary = ""
+    try:
+        summary = jira_issue_plain_field(issue, "summary")
+    except Exception:
+        logger.exception("Failed reading summary for %s", issue_key)
+    updated = best_effort_get_field_from_issue(issue, _FIELD_UPDATED)
+    created = best_effort_get_field_from_issue(issue, _FIELD_CREATED)
+    page_url = build_jira_url(jira_base_url, issue_key)
+    metadata_dict, people = _build_jira_metadata(issue, field_stats)
+    if field_stats is not None:
+        field_stats.issues_processed += 1
 
     return Document(
         id=page_url,
         sections=[TextSection(link=page_url, text=ticket_content)],
         source=DocumentSource.JIRA,
-        semantic_identifier=f"{issue.key}: {issue.fields.summary}",
-        title=f"{issue.key} {issue.fields.summary}",
-        doc_updated_at=time_str_to_utc(issue.fields.updated),
-        # NOTE: doc_created_at population not yet verified against live data
-        doc_created_at=time_str_to_utc(issue.fields.created),
+        semantic_identifier=f"{issue_key}: {summary}".rstrip(),
+        title=f"{issue_key} {summary}".rstrip(),
+        doc_updated_at=time_str_to_utc(updated) if isinstance(updated, str) else None,
+        doc_created_at=time_str_to_utc(created) if isinstance(created, str) else None,
         primary_owners=list(people) or None,
         metadata=metadata_dict,
         parent_hierarchy_raw_node_id=parent_hierarchy_raw_node_id,
@@ -543,8 +738,8 @@ class JiraConnector(
         self.jql_query = jql_query
         self.scoped_token = scoped_token
         self._jira_client: JIRA | None = None
-        # Cache project permissions to avoid fetching them repeatedly across runs
         self._project_permissions_cache: dict[str, Any] = {}
+        self._field_stats = JiraFieldStats()
 
     @property
     def comment_email_blacklist(self) -> tuple:
@@ -589,9 +784,7 @@ class JiraConnector(
     def _is_epic(self, issue: Issue) -> bool:
         """Check if issue is an Epic."""
         issuetype = best_effort_get_field_from_issue(issue, _FIELD_ISSUETYPE)
-        if issuetype is None:
-            return False
-        return issuetype.name.lower() == "epic"
+        return jira_named_value(issuetype).lower() == "epic" if issuetype else False
 
     def _is_parent_epic(self, parent: Any) -> bool:
         """Check if a parent reference is an Epic.
@@ -599,14 +792,12 @@ class JiraConnector(
         The parent object from issue.fields.parent has a different structure
         than a full Issue, so we handle it separately.
         """
-        parent_issuetype = (
-            getattr(parent.fields, "issuetype", None)  # ods: ignore[getattr]
-            if hasattr(parent, "fields")
-            else None
+        parent_issuetype = best_effort_get_field_from_issue(parent, _FIELD_ISSUETYPE)
+        return (
+            jira_named_value(parent_issuetype).lower() == "epic"
+            if parent_issuetype
+            else False
         )
-        if parent_issuetype is None:
-            return False
-        return parent_issuetype.name.lower() == "epic"
 
     def _yield_project_hierarchy_node(
         self,
@@ -635,7 +826,7 @@ class JiraConnector(
         seen_hierarchy_node_ids: set[str],
     ) -> Generator[HierarchyNode, None, None]:
         """Yield a hierarchy node for an Epic issue."""
-        issue_key = issue.key
+        issue_key = jira_issue_key(issue)
         if issue_key in seen_hierarchy_node_ids:
             return
 
@@ -644,7 +835,7 @@ class JiraConnector(
         yield HierarchyNode(
             raw_node_id=issue_key,
             raw_parent_id=project_key,
-            display_name=f"{issue_key}: {issue.fields.summary}",
+            display_name=f"{issue_key}: {jira_issue_plain_field(issue, 'summary')}",
             link=build_jira_url(self.jira_base, issue_key),
             node_type=HierarchyNodeType.FOLDER,  # don't have a separate epic node type
         )
@@ -656,7 +847,10 @@ class JiraConnector(
         seen_hierarchy_node_ids: set[str],
     ) -> Generator[HierarchyNode, None, None]:
         """Yield hierarchy node for parent issue if it's an Epic we haven't seen."""
-        parent_key = parent.key
+        parent_key = jira_key_value(parent)
+        if not parent_key:
+            logger.warning("Skipping Jira parent hierarchy node without a key")
+            return
         if parent_key in seen_hierarchy_node_ids:
             return
 
@@ -666,12 +860,8 @@ class JiraConnector(
 
         seen_hierarchy_node_ids.add(parent_key)
 
-        # Get summary if available
-        parent_summary = (
-            getattr(parent.fields, "summary", None)  # ods: ignore[getattr]
-            if hasattr(parent, "fields")
-            else None
-        )
+        # Payload-first: parent.fields.summary can lazy-load and fail the ticket.
+        parent_summary = jira_issue_plain_field(parent, "summary")
         display_name = (
             f"{parent_key}: {parent_summary}" if parent_summary else parent_key
         )
@@ -697,7 +887,7 @@ class JiraConnector(
             return project_key
 
         if self._is_parent_epic(parent):
-            return parent.key
+            return jira_key_value(parent) or project_key
 
         # For non-epic parents (e.g., story with subtasks),
         # the document belongs directly under the project in the hierarchy
@@ -794,11 +984,12 @@ class JiraConnector(
             ids_done=new_checkpoint.ids_done,
         ):
             issue_key = issue.key
+            self._field_stats.issues_fetched += 1
             try:
                 # Get project info for hierarchy
                 project = best_effort_get_field_from_issue(issue, _FIELD_PROJECT)
-                project_key = project.key if project else None
-                project_name = project.name if project else None
+                project_key = jira_key_value(project)
+                project_name = jira_named_value(project)
 
                 # Yield hierarchy nodes BEFORE the document (parent-before-child)
                 if project_key:
@@ -833,6 +1024,8 @@ class JiraConnector(
                     comment_email_blacklist=self.comment_email_blacklist,
                     labels_to_skip=self.labels_to_skip,
                     parent_hierarchy_raw_node_id=parent_hierarchy_raw_node_id,
+                    field_stats=self._field_stats,
+                    jira_client=self.jira_client,
                 ):
                     # Add permission information to the document if requested
                     if include_permissions:
@@ -843,6 +1036,8 @@ class JiraConnector(
                     yield document
 
             except Exception as e:
+                self._field_stats.issues_failed += 1
+                logger.exception("Failed processing Jira issue %s", issue_key)
                 yield ConnectorFailure(
                     failed_document=DocumentFailure(
                         document_id=issue_key,
@@ -861,6 +1056,8 @@ class JiraConnector(
         self.update_checkpoint_for_next_run(
             new_checkpoint, current_offset, starting_offset, _JIRA_FULL_PAGE_SIZE
         )
+        if not new_checkpoint.has_more:
+            self._field_stats.log_summary()
 
         return new_checkpoint
 
@@ -941,8 +1138,8 @@ class JiraConnector(
             ):
                 # Get project info
                 project = best_effort_get_field_from_issue(issue, _FIELD_PROJECT)
-                project_key = project.key if project else None
-                project_name = project.name if project else None
+                project_key = jira_key_value(project)
+                project_name = jira_named_value(project)
 
                 if not project_key:
                     continue

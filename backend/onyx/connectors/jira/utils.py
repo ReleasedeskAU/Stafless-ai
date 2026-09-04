@@ -1,15 +1,25 @@
 """Module with custom fields processing functions"""
 
+from __future__ import annotations
+
 import os
-from typing import Any, List
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, List
 from urllib.parse import urlparse
 
 from jira import JIRA
+from jira.exceptions import JIRAError
 from jira.resources import CustomFieldOption, Issue, User
 
 from onyx.connectors.cross_connector_utils.miscellaneous_utils import scoped_url
+from onyx.connectors.cross_connector_utils.rate_limit_wrapper import (
+    RateLimitTriedTooManyTimesError,
+    wrap_request_to_handle_ratelimiting,
+)
 from onyx.connectors.models import BasicExpertInfo
 from onyx.utils.logger import setup_logger
+from onyx.utils.retry_after import parse_retry_after_seconds
 
 logger = setup_logger()
 
@@ -18,61 +28,538 @@ PROJECT_URL_PAT = "projects"
 JIRA_SERVER_API_VERSION = os.environ.get("JIRA_SERVER_API_VERSION") or "2"
 JIRA_CLOUD_API_VERSION = os.environ.get("JIRA_CLOUD_API_VERSION") or "3"
 
+# Source-present vs tagged — logged after each sync so incomplete fields cannot hide.
+JIRA_COMPLETENESS_FIELDS = (
+    "assignee",
+    "assignee_email",
+    "reporter",
+    "reporter_email",
+    "status",
+    "priority",
+    "resolution",
+    "issuetype",
+    "project",
+    "project_name",
+    "labels",
+    "key",
+    "created",
+    "updated",
+    "duedate",
+    "resolution_date",
+    "parent",
+)
 
-def best_effort_basic_expert_info(obj: Any) -> BasicExpertInfo | None:
-    display_name = None
-    email = None
 
+@dataclass
+class JiraFieldStats:
+    """Per-sync counts of Jira fields present on the payload vs written as tags."""
+
+    issues_fetched: int = 0
+    issues_processed: int = 0
+    issues_failed: int = 0
+    issues_skipped_label: int = 0
+    issues_skipped_size: int = 0
+    present: dict[str, int] = field(default_factory=dict)
+    tagged: dict[str, int] = field(default_factory=dict)
+    dropped: dict[str, int] = field(default_factory=dict)
+
+    def observe(
+        self,
+        field_name: str,
+        *,
+        present: bool,
+        tagged: bool,
+        issue_key: str,
+        reason: str | None = None,
+    ) -> None:
+        """Record one field on one issue. Logs when the source had a value we did not tag."""
+        if present:
+            self.present[field_name] = self.present.get(field_name, 0) + 1
+        if tagged:
+            self.tagged[field_name] = self.tagged.get(field_name, 0) + 1
+            return
+        if not present:
+            return
+        self.dropped[field_name] = self.dropped.get(field_name, 0) + 1
+        logger.warning(
+            "Jira issue %s: field %s present on the source record but not tagged (%s)",
+            issue_key,
+            field_name,
+            reason or "unusable value",
+        )
+
+    def log_summary(self) -> None:
+        """Emit completeness rates. Mismatches are errors so they cannot be ignored."""
+        parts = [
+            f"{name}={self.tagged.get(name, 0)}/{self.present.get(name, 0)}"
+            for name in JIRA_COMPLETENESS_FIELDS
+        ]
+        logger.notice(
+            "Jira sync summary: fetched=%s emitted=%s failed=%s "
+            "skipped_label=%s skipped_size=%s field_completeness=[%s]",
+            self.issues_fetched,
+            self.issues_processed,
+            self.issues_failed,
+            self.issues_skipped_label,
+            self.issues_skipped_size,
+            " ".join(parts),
+        )
+        for name in JIRA_COMPLETENESS_FIELDS:
+            n_present = self.present.get(name, 0)
+            n_tagged = self.tagged.get(name, 0)
+            if n_present and n_tagged != n_present:
+                logger.error(
+                    "Jira sync field mismatch: %s tagged %s of %s source-present values — index is incomplete",
+                    name,
+                    n_tagged,
+                    n_present,
+                )
+
+
+def _stringish(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
+
+
+def _payload_only(obj: Any, key: str) -> Any:
+    """Read a field from the JSON already on the issue. Never Resource getattr."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    raw = getattr(obj, "raw", None)
+    if isinstance(raw, dict):
+        return raw.get(key)
+    return None
+
+
+def _attr_or_raw(obj: Any, key: str) -> Any:
+    """Read a Jira field from payload JSON, then an already-set instance attribute."""
+    value = _payload_only(obj, key)
+    if value is not None:
+        return value
+    if obj is None or isinstance(obj, dict):
+        return None
     try:
-        if hasattr(obj, "displayName"):
-            display_name = obj.displayName
-        else:
-            display_name = obj.get("displayName")
-
-        if hasattr(obj, "emailAddress"):
-            email = obj.emailAddress
-        else:
-            email = obj.get("emailAddress")
-
+        return object.__getattribute__(obj, key)
     except Exception:
         return None
 
-    if not email and not display_name:
-        return None
 
-    return BasicExpertInfo(display_name=display_name, email=email)
+def jira_user_display_name(obj: Any) -> str | None:
+    """Visible name already on the assignee/reporter object. Email is never used."""
+    return _stringish(_attr_or_raw(obj, "displayName")) or _stringish(
+        _attr_or_raw(obj, "name")
+    )
+
+
+def jira_user_email(obj: Any) -> str | None:
+    """Email only when Jira already included it on the issue payload.
+
+    Must not getattr emailAddress on a python-jira User: that can lazy-load
+    /rest/api/3/user and fail for privacy-restricted accounts. The name tag
+    must not depend on this call.
+    """
+    return _stringish(_payload_only(obj, "emailAddress"))
+
+
+def jira_named_value(obj: Any) -> str | None:
+    """Status/priority/issuetype/project name from a Resource or raw dict."""
+    if obj is None:
+        return None
+    direct = _stringish(obj)
+    if direct:
+        return direct
+    return _stringish(_attr_or_raw(obj, "name"))
+
+
+def jira_key_value(obj: Any) -> str | None:
+    """Issue or project key from a Resource or raw dict."""
+    if obj is None:
+        return None
+    return _stringish(_attr_or_raw(obj, "key")) or _stringish(obj)
+
+
+def jira_label_values(obj: Any) -> list[str]:
+    """Normalize labels to a list of strings. Objects without a name are skipped."""
+    if not obj:
+        return []
+    items = obj if isinstance(obj, list) else [obj]
+    values: list[str] = []
+    for item in items:
+        text = _stringish(item) or jira_named_value(item)
+        if text:
+            values.append(text)
+    return values
+
+
+def best_effort_basic_expert_info(obj: Any) -> BasicExpertInfo | None:
+    """Person identity for owners. Name comes from displayName; email is optional."""
+    if obj is None:
+        return None
+    display_name = jira_user_display_name(obj)
+    if not display_name:
+        return None
+    return BasicExpertInfo(display_name=display_name, email=jira_user_email(obj))
 
 
 def best_effort_get_field_from_issue(jira_issue: Issue, field: str) -> Any:
-    if hasattr(jira_issue, field):
-        return getattr(jira_issue, field)  # ods: ignore[getattr]
-
-    if hasattr(jira_issue, "fields") and hasattr(jira_issue.fields, field):
-        return getattr(jira_issue.fields, field)  # ods: ignore[getattr]
-
+    """Read issue fields from raw JSON first so Resource getattr cannot hide values."""
+    if isinstance(jira_issue, dict):
+        fields = jira_issue.get("fields")
+        if isinstance(fields, dict) and field in fields:
+            return fields[field]
+        return jira_issue.get(field)
+    raw = getattr(jira_issue, "raw", None)
+    if isinstance(raw, dict):
+        fields = raw.get("fields")
+        if isinstance(fields, dict) and field in fields:
+            return fields[field]
+        if field in raw:
+            return raw[field]
     try:
-        return jira_issue.raw["fields"][field]
+        fields_obj = getattr(jira_issue, "fields", None)
+        if isinstance(fields_obj, dict):
+            return fields_obj.get(field)
+        if fields_obj is not None:
+            return getattr(fields_obj, field, None)
     except Exception:
-        return None
+        logger.warning("Failed reading Jira field %s from issue object", field)
+    return None
 
 
-def extract_text_from_adf(adf: dict | None) -> str:
-    """Extracts plain text from Atlassian Document Format:
+# Structural ADF nodes: walk children, no warning.
+_ADF_CONTAINERS = frozenset(
+    {
+        "doc",
+        "paragraph",
+        "heading",
+        "blockquote",
+        "bulletList",
+        "orderedList",
+        "listItem",
+        "codeBlock",
+        "panel",
+        "table",
+        "tableRow",
+        "tableCell",
+        "tableHeader",
+        "mediaSingle",
+        "mediaGroup",
+        "expand",
+        "nestedExpand",
+        "decisionList",
+        "decisionItem",
+        "taskList",
+        "taskItem",
+        "layoutSection",
+        "layoutColumn",
+    }
+)
+_ADF_BLOCK_BREAKS = frozenset({"paragraph", "heading", "listItem", "blockquote"})
+_JIRA_COMMENT_PAGE_SIZE = 100
+_JIRA_429_DEFAULT_WAIT_SEC = 30
+_JIRA_429_MAX_WAIT_SEC = 300
+_JIRA_429_MAX_RETRIES = 8
+
+
+def _adf_link_href(node: dict[str, Any]) -> str | None:
+    for mark in node.get("marks") or []:
+        if isinstance(mark, dict) and mark.get("type") == "link":
+            href = (mark.get("attrs") or {}).get("href")
+            if isinstance(href, str) and href.strip():
+                return href.strip()
+    return None
+
+
+def _adf_leaf_text(node: dict[str, Any]) -> str:
+    """Readable text for one ADF leaf. Mentions, status, emoji, and links stay visible."""
+    ntype = node.get("type")
+    attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+    if ntype == "text":
+        text = _stringish(node.get("text")) or ""
+        href = _adf_link_href(node)
+        return f"[{text}]({href})" if href and text else text
+    if ntype == "mention":
+        name = _stringish(attrs.get("text")) or _stringish(attrs.get("id")) or "mention"
+        return f"@{name.lstrip('@')}"
+    if ntype == "emoji":
+        return _stringish(attrs.get("text")) or _stringish(attrs.get("shortName")) or ""
+    if ntype == "status":
+        return f"[{_stringish(attrs.get('text')) or 'status'}]"
+    if ntype == "date":
+        return _stringish(str(attrs.get("timestamp") or "")) or ""
+    if ntype in {"inlineCard", "blockCard", "embedCard"}:
+        url = attrs.get("url")
+        if isinstance(url, dict):
+            url = url.get("url")
+        return _stringish(url) or ""
+    if ntype == "hardBreak":
+        return "\n"
+    if ntype == "rule":
+        return "\n---\n"
+    if ntype == "media":
+        label = _stringish(attrs.get("alt")) or _stringish(attrs.get("id"))
+        return f"[media: {label}]" if label else "[media]"
+    return ""
+
+
+def _adf_attr_fallback(node: dict[str, Any]) -> str:
+    attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+    for key in ("text", "shortName", "url", "alt", "id"):
+        value = attrs.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("text")
+        text = _stringish(value)
+        if text:
+            return text
+    return _stringish(node.get("text")) or ""
+
+
+def extract_text_from_adf(adf: dict | str | None) -> str:
+    """Turn ADF into readable text. Unknown node types warn instead of vanishing.
+
     https://developer.atlassian.com/cloud/jira/platform/apis/document/structure/
     """
-    texts: list[str] = []
+    if adf is None:
+        return ""
+    if isinstance(adf, str):
+        return adf
+    if not isinstance(adf, dict):
+        return str(adf)
+    parts: list[str] = []
+    unknown: set[str] = set()
+    _walk_adf(adf, parts, unknown)
+    return _join_adf_parts(parts)
 
-    def _extract(node: dict) -> None:
-        if node.get("type") == "text":
-            text = node.get("text", "")
-            if text:
-                texts.append(text)
-        for child in node.get("content", []):
-            _extract(child)
 
-    if adf is not None:
-        _extract(adf)
-    return " ".join(texts)
+def _walk_adf(node: Any, parts: list[str], unknown: set[str]) -> None:
+    if not isinstance(node, dict):
+        return
+    ntype = node.get("type")
+    leaf = _adf_leaf_text(node)
+    children = [
+        child for child in (node.get("content") or []) if isinstance(child, dict)
+    ]
+    if ntype in {
+        "text",
+        "mention",
+        "emoji",
+        "status",
+        "date",
+        "hardBreak",
+        "rule",
+        "media",
+    } or ntype in {
+        "inlineCard",
+        "blockCard",
+        "embedCard",
+    }:
+        if leaf:
+            parts.append(leaf)
+        return
+    if ntype not in _ADF_CONTAINERS:
+        if ntype not in unknown:
+            unknown.add(str(ntype))
+            logger.warning("Unhandled ADF node type %s; using text fallback", ntype)
+        fallback = _adf_attr_fallback(node)
+        if fallback:
+            parts.append(fallback)
+    for child in children:
+        _walk_adf(child, parts, unknown)
+    if ntype in _ADF_BLOCK_BREAKS:
+        parts.append("\n")
+
+
+def _join_adf_parts(parts: list[str]) -> str:
+    chunks: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if chunks and not part.startswith("\n") and not chunks[-1].endswith("\n"):
+            chunks.append(" ")
+        chunks.append(part)
+    return "".join(chunks).strip()
+
+
+def jira_body_text(payload: Any) -> str:
+    """Plain text from a Jira description/comment body (string or ADF)."""
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        return extract_text_from_adf(payload)
+    raw = getattr(payload, "raw", None)
+    if isinstance(raw, dict):
+        return extract_text_from_adf(raw)
+    for attr in ("body", "text"):
+        value = getattr(payload, attr, None)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return extract_text_from_adf(value)
+    return ""
+
+
+def jira_issue_key(issue: Any) -> str:
+    """Issue key from the payload or object, without lazy field loads."""
+    return (
+        _stringish(getattr(issue, "key", None))
+        or jira_key_value(issue)
+        or _stringish(best_effort_get_field_from_issue(issue, "key"))
+        or "unknown"
+    )
+
+
+def jira_issue_plain_field(issue: Issue, field: str) -> str:
+    """Read one issue field as text from raw JSON first."""
+    return jira_body_text(best_effort_get_field_from_issue(issue, field))
+
+
+def jira_session_request(session: Any, method: str, *args: Any, **kwargs: Any) -> Any:
+    """HTTP call that retries Jira 429s using Retry-After, then raise_for_status."""
+    request_fn = wrap_request_to_handle_ratelimiting(
+        getattr(session, method),
+        default_wait_time_sec=_JIRA_429_DEFAULT_WAIT_SEC,
+        max_waits=_JIRA_429_MAX_RETRIES,
+        max_wait_time_sec=_JIRA_429_MAX_WAIT_SEC,
+    )
+    response = request_fn(*args, **kwargs)
+    response.raise_for_status()
+    return response
+
+
+def jira_sdk_call(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Retry python-jira SDK calls when Jira returns 429."""
+    last_error: Exception | None = None
+    for _ in range(_JIRA_429_MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except JIRAError as exc:
+            last_error = exc
+            if exc.status_code != 429:
+                raise
+            response = getattr(exc, "response", None)
+            headers = (
+                getattr(response, "headers", None)
+                or getattr(exc, "headers", None)
+                or {}
+            )
+            parsed = parse_retry_after_seconds(
+                headers.get("Retry-After") if hasattr(headers, "get") else None
+            )
+            wait = min(parsed or _JIRA_429_DEFAULT_WAIT_SEC, _JIRA_429_MAX_WAIT_SEC)
+            logger.warning(
+                "Jira SDK rate-limited (429). Retrying after %s seconds", wait
+            )
+            time.sleep(wait)
+    raise RateLimitTriedTooManyTimesError(
+        f"Exceeded '{_JIRA_429_MAX_RETRIES}' Jira 429 retries"
+    ) from last_error
+
+
+def _comment_records(comment_field: Any) -> tuple[list[Any], int | None]:
+    if comment_field is None:
+        return [], None
+    if isinstance(comment_field, list):
+        return list(comment_field), None
+    if isinstance(comment_field, dict):
+        comments = comment_field.get("comments") or []
+        total = comment_field.get("total")
+        return list(comments), int(total) if isinstance(total, int) else None
+    comments = getattr(comment_field, "comments", None) or []
+    total = getattr(comment_field, "total", None)
+    return list(comments), int(total) if isinstance(total, int) else None
+
+
+def _comment_body_text(comment: Any) -> str:
+    if isinstance(comment, dict):
+        return jira_body_text(comment.get("body"))
+    raw = getattr(comment, "raw", None)
+    if isinstance(raw, dict) and "body" in raw:
+        return jira_body_text(raw.get("body"))
+    return jira_body_text(getattr(comment, "body", None))
+
+
+def _comment_author(comment: Any) -> Any:
+    if isinstance(comment, dict):
+        return comment.get("author")
+    raw = getattr(comment, "raw", None)
+    if isinstance(raw, dict) and "author" in raw:
+        return raw.get("author")
+    return getattr(comment, "author", None)
+
+
+def fetch_all_jira_comments(jira_client: JIRA, issue_key: str) -> list[Any]:
+    """Page every comment for one issue. Raises if the source total is not reached."""
+    comments: list[Any] = []
+    start_at = 0
+    total: int | None = None
+    next_page_token: str | None = None
+    comment_url = jira_client._get_url(f"issue/{issue_key}/comment")
+    while True:
+        params: dict[str, Any] = {"maxResults": _JIRA_COMMENT_PAGE_SIZE}
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+        else:
+            params["startAt"] = start_at
+        response = jira_session_request(
+            jira_client._session, "get", comment_url, params=params
+        )
+        payload = response.json()
+        page = payload.get("comments") or []
+        comments.extend(page)
+        if isinstance(payload.get("total"), int):
+            total = payload["total"]
+        next_page_token = payload.get("nextPageToken")
+        start_at = int(payload.get("startAt") or start_at) + len(page)
+        if total is not None and len(comments) >= total:
+            break
+        if not page:
+            break
+        if not next_page_token and (total is None or start_at >= total):
+            break
+    if total is not None and len(comments) != total:
+        raise RuntimeError(
+            f"Jira issue {issue_key}: fetched {len(comments)} of {total} comments"
+        )
+    return comments
+
+
+def get_comment_strs(
+    issue: Issue,
+    comment_email_blacklist: tuple[str, ...] = (),
+    jira_client: JIRA | None = None,
+) -> list[str]:
+    """All comment bodies for an issue. Pages the comment API when a page is truncated."""
+    issue_key = jira_issue_key(issue)
+    comment_field = best_effort_get_field_from_issue(issue, "comment")
+    comments, total = _comment_records(comment_field)
+    incomplete = total is not None and len(comments) < total
+    # Missing total on a non-empty first page is the classic silent 20-comment cut-off.
+    if jira_client is not None and (
+        comment_field is None or incomplete or (comments and total is None)
+    ):
+        comments = fetch_all_jira_comments(jira_client, issue_key)
+        total = len(comments)
+    if total is not None and len(comments) < total:
+        raise RuntimeError(
+            f"Jira issue {issue_key}: only {len(comments)} of {total} comments were available"
+        )
+    bodies: list[str] = []
+    for comment in comments:
+        try:
+            author_email = jira_user_email(_comment_author(comment))
+            if author_email and author_email in comment_email_blacklist:
+                continue
+            bodies.append(_comment_body_text(comment))
+        except Exception as exc:
+            logger.error("Failed to process comment on %s: %s", issue_key, exc)
+            bodies.append("[unreadable comment]")
+    return bodies
 
 
 def build_jira_url(jira_base_url: str, issue_key: str) -> str:
@@ -119,32 +606,6 @@ def extract_jira_project(url: str) -> tuple[str, str]:
         raise ValueError("'projects' not found in the URL")
 
     return jira_base, jira_project
-
-
-def get_comment_strs(
-    issue: Issue, comment_email_blacklist: tuple[str, ...] = ()
-) -> list[str]:
-    comment_strs = []
-    for comment in issue.fields.comment.comments:
-        try:
-            if isinstance(comment.body, str):
-                body_text = comment.body
-            else:
-                body_text = extract_text_from_adf(comment.raw["body"])
-
-            if (
-                hasattr(comment, "author")
-                and hasattr(comment.author, "emailAddress")
-                and comment.author.emailAddress in comment_email_blacklist
-            ):
-                continue  # Skip adding comment if author's email is in blacklist
-
-            comment_strs.append(body_text)
-        except Exception as e:
-            logger.error("Failed to process comment due to an error: %s", e)
-            continue
-
-    return comment_strs
 
 
 def get_jira_project_key_from_issue(issue: Issue) -> str | None:
