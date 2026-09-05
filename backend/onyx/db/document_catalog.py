@@ -23,9 +23,24 @@ from onyx.db.document_count import (
     matching_document_ids,
     queryable_fields,
 )
+from onyx.db.document_date_filter import (
+    DATE_TAG_KEYS,
+    DateRangeSpec,
+    intersect_date_range_ids,
+    parse_date_bucket,
+    parse_sort_by,
+)
 from onyx.db.models import Connector, Document, DocumentByConnectorCredentialPair, Document__Tag, Tag
 
 KEY_TAG = "key"
+LIST_PROJECTION_KEYS = (
+    "assignee",
+    "status",
+    "priority",
+    "created",
+    "updated",
+    "duedate",
+)
 
 
 def ticket_key_from_semantic_id(semantic_id: str | None) -> str | None:
@@ -78,6 +93,7 @@ def breakdown_by_tag(
     *,
     source: DocumentSource | None,
     filter_field: str,
+    date_bucket: str | None = None,
 ) -> dict[str, object]:
     """Exact unique-document counts grouped by one allow-listed tag key.
 
@@ -88,11 +104,15 @@ def breakdown_by_tag(
         db_session: Tenant DB session.
         source: Restrict to this DocumentSource, or all sources.
         filter_field: Allow-listed tag key.
+        date_bucket: When "month", group date tags by YYYY-MM.
 
     Returns:
         groups [{value, count}], untagged_count, total_indexed, truncated.
     """
-    rows, truncated = _group_counts(db_session, source, filter_field)
+    bucket = parse_date_bucket(date_bucket)
+    if bucket and filter_field not in DATE_TAG_KEYS:
+        raise DocumentCountError("date_bucket requires a date field")
+    rows, truncated = _group_counts(db_session, source, filter_field, date_bucket=bucket)
     total = _count_indexed_by_source(db_session, source)
     tagged_docs = _count_docs_with_tag_key(db_session, source, filter_field)
     groups = [{"value": value, "count": count} for value, count in rows]
@@ -112,33 +132,50 @@ def list_documents_matching_filter(
     *,
     source: DocumentSource | None,
     filters: list[tuple[str, str]],
+    date_ranges: list[DateRangeSpec] | None = None,
+    sort_by: str | None = None,
 ) -> dict[str, object]:
     """Exact indexed documents matching AND tag filters, with ticket keys.
 
     Same match rules as document-count. Results are capped; count is the full
-    unique-document total so callers can say first 50 of N.
+    unique-document total so callers can say first 50 of N. List rows include
+    assignee/status/created/updated/duedate so follow-ups do not need one-by-one
+    lookups for those fields.
 
     Args:
         db_session: Tenant DB session.
         source: Restrict to this DocumentSource, or all sources.
         filters: Allow-listed field/value pairs combined with AND.
+        date_ranges: Optional governed date comparisons.
+        sort_by: key_asc (default) or created/updated asc/desc.
 
     Returns:
-        count, documents[{key, title, link}], filters, truncated, cap.
+        count, documents[{key, title, link, …projection}], filters, truncated, cap.
 
     Raises:
-        DocumentCountError: Empty filters.
+        DocumentCountError: No tag filter and no date range.
     """
-    if not filters:
+    ranges = date_ranges or []
+    if not filters and not ranges:
         raise DocumentCountError("At least one filter is required")
-    resolved = _resolve_filters(db_session, source, filters)
-    if any(not item["matched_values"] for item in resolved):
+    resolved = _resolve_filters(db_session, source, filters) if filters else []
+    if filters and any(not item["matched_values"] for item in resolved):
         return _matching_list_payload([], 0, source, resolved, truncated=False)
-    specs = [(str(item["filter_field"]), list(item["matched_values"])) for item in resolved]
-    doc_ids = matching_document_ids(db_session, source, specs)
-    true_count = len(doc_ids)
+    tag_ids = (
+        set(matching_document_ids(
+            db_session,
+            source,
+            [(str(item["filter_field"]), list(item["matched_values"])) for item in resolved],
+        ))
+        if filters
+        else None
+    )
+    range_ids = intersect_date_range_ids(db_session, source, ranges)
+    doc_ids = _combine_id_sets(tag_ids, range_ids)
+    ordered = _sort_document_ids(db_session, list(doc_ids), parse_sort_by(sort_by))
+    true_count = len(ordered)
     truncated = true_count > MAX_CATALOG_ROWS
-    documents = _documents_with_keys(db_session, doc_ids[:MAX_CATALOG_ROWS])
+    documents = _documents_with_keys(db_session, ordered[:MAX_CATALOG_ROWS])
     return _matching_list_payload(
         documents, true_count, source, resolved, truncated=truncated
     )
@@ -193,14 +230,18 @@ def catalog_document_row(
     key: str | None,
     semantic_id: str | None,
     link: str | None,
+    extras: dict[str, str | None] | None = None,
 ) -> dict[str, str | None]:
     """One list-result document. Key tag wins; semantic_id prefix is the fallback."""
     resolved = (key or "").strip() or ticket_key_from_semantic_id(semantic_id)
-    return {
+    row: dict[str, str | None] = {
         "key": resolved,
         "title": (semantic_id or "").strip() or resolved,
         "link": link,
     }
+    if extras:
+        row.update(extras)
+    return row
 
 
 def _matching_list_payload(
@@ -231,6 +272,41 @@ def _matching_list_payload(
     }
 
 
+def _combine_id_sets(
+    tag_ids: set[str] | None, range_ids: set[str] | None
+) -> set[str]:
+    if tag_ids is None:
+        return range_ids or set()
+    if range_ids is None:
+        return tag_ids
+    return tag_ids & range_ids
+
+
+def _sort_document_ids(
+    db_session: Session, doc_ids: list[str], sort_by: str
+) -> list[str]:
+    if not doc_ids:
+        return []
+    if sort_by == "key_asc":
+        return sorted(doc_ids)
+    docs = {
+        str(row.id): row
+        for row in db_session.execute(select(Document).where(Document.id.in_(doc_ids))).scalars()
+    }
+    attr = "doc_created_at" if sort_by.startswith("created") else "doc_updated_at"
+    reverse = sort_by.endswith("_desc")
+    present: list[tuple[str, object]] = []
+    missing: list[str] = []
+    for doc_id in doc_ids:
+        value = getattr(docs.get(doc_id), attr, None)
+        if value is None:
+            missing.append(doc_id)
+        else:
+            present.append((doc_id, value))
+    present.sort(key=lambda item: item[1], reverse=reverse)
+    return [doc_id for doc_id, _ in present] + missing
+
+
 def _documents_with_keys(
     db_session: Session, doc_ids: list[str]
 ) -> list[dict[str, str | None]]:
@@ -240,33 +316,51 @@ def _documents_with_keys(
         str(row.id): row
         for row in db_session.execute(select(Document).where(Document.id.in_(doc_ids))).scalars()
     }
-    key_rows = db_session.execute(
-        select(Document__Tag.document_id, Tag.tag_value)
-        .join(Tag, Tag.id == Document__Tag.tag_id)
-        .where(Document__Tag.document_id.in_(doc_ids))
-        .where(Tag.tag_key == KEY_TAG)
-    ).all()
-    keys = {str(doc_id): str(value) for doc_id, value in key_rows}
-    rows = [
+    projection = _list_projection(db_session, doc_ids)
+    return [
         catalog_document_row(
-            key=keys.get(doc_id),
+            key=projection.get(doc_id, {}).get("key"),
             semantic_id=docs[doc_id].semantic_id,
             link=docs[doc_id].link,
+            extras=_projection_extras(projection.get(doc_id, {})),
         )
         for doc_id in doc_ids
         if doc_id in docs
     ]
-    rows.sort(key=lambda row: (row.get("key") or "", row.get("title") or ""))
-    return rows
+
+
+def _list_projection(
+    db_session: Session, doc_ids: list[str]
+) -> dict[str, dict[str, str]]:
+    keys = (KEY_TAG, *LIST_PROJECTION_KEYS)
+    rows = db_session.execute(
+        select(Document__Tag.document_id, Tag.tag_key, Tag.tag_value)
+        .join(Tag, Tag.id == Document__Tag.tag_id)
+        .where(Document__Tag.document_id.in_(doc_ids))
+        .where(Tag.tag_key.in_(keys))
+    ).all()
+    out: dict[str, dict[str, str]] = {}
+    for doc_id, tag_key, tag_value in rows:
+        out.setdefault(str(doc_id), {})[str(tag_key)] = str(tag_value)
+    return out
+
+
+def _projection_extras(fields: dict[str, str]) -> dict[str, str | None]:
+    """Always emit projection keys so an unassigned ticket is explicit null."""
+    return {key: fields.get(key) for key in LIST_PROJECTION_KEYS}
 
 
 def _group_counts(
     db_session: Session,
     source: DocumentSource | None,
     filter_field: str,
+    date_bucket: str | None = None,
 ) -> tuple[list[tuple[str, int]], bool]:
+    value_expr = (
+        func.substr(Tag.tag_value, 1, 7) if date_bucket == "month" else Tag.tag_value
+    )
     stmt = (
-        select(Tag.tag_value, func.count(distinct(Document__Tag.document_id)))
+        select(value_expr, func.count(distinct(Document__Tag.document_id)))
         .select_from(Document__Tag)
         .join(Tag, Tag.id == Document__Tag.tag_id)
         .join(
@@ -275,8 +369,8 @@ def _group_counts(
         )
         .where(DocumentByConnectorCredentialPair.has_been_indexed.is_(True))
         .where(Tag.tag_key == filter_field)
-        .group_by(Tag.tag_value)
-        .order_by(func.count(distinct(Document__Tag.document_id)).desc(), Tag.tag_value)
+        .group_by(value_expr)
+        .order_by(func.count(distinct(Document__Tag.document_id)).desc(), value_expr)
         .limit(MAX_CATALOG_ROWS + 1)
     )
     if source is not None:

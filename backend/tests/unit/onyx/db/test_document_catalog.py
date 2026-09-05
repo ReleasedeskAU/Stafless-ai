@@ -21,6 +21,17 @@ def test_catalog_document_row_prefers_key_tag() -> None:
     assert row["link"] == "https://example.test/browse/RD-10"
 
 
+def test_catalog_document_row_keeps_unassigned_explicit() -> None:
+    row = catalog_document_row(
+        key="RD-142",
+        semantic_id="RD-142: Highest",
+        link=None,
+        extras={"assignee": None, "status": "To Do", "created": "2026-08-01"},
+    )
+    assert row["assignee"] is None
+    assert row["status"] == "To Do"
+
+
 def test_catalog_document_row_falls_back_to_semantic_prefix() -> None:
     row = catalog_document_row(
         key=None,

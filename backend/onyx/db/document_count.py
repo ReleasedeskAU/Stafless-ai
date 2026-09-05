@@ -12,6 +12,13 @@ from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import Session
 
 from onyx.configs.constants import DocumentSource
+from onyx.db.document_date_filter import (
+    DATE_TAG_KEYS,
+    RESOLVED_STATUS_VALUES,
+    SORT_BY_VALUES,
+    DateRangeSpec,
+    intersect_date_range_ids,
+)
 from onyx.db.models import Connector, DocumentByConnectorCredentialPair, Document__Tag, Tag
 
 # Never queryable or returned. Enforced at parse and at field projection.
@@ -34,9 +41,13 @@ ALLOWED_TAG_KEYS = frozenset(
         "updated",
         "resolution",
         "resolution_date",
+        "issuelink",
+        "issuelink_type",
+        "last_updater",
+        "status_was",
     }
 )
-CONTAINS_TAG_KEYS = frozenset({"assignee", "reporter", "labels"})
+CONTAINS_TAG_KEYS = frozenset({"assignee", "reporter", "labels", "last_updater"})
 MAX_FILTER_VALUE_CHARS = 80
 MAX_MATCHED_VALUES = 20
 MAX_DOCUMENT_KEY_CHARS = 40
@@ -101,9 +112,36 @@ def queryable_fields() -> dict[str, object]:
         "fields": fields,
         "contains_match": contains,
         "exact_match": exact,
+        "resolved_statuses": list(RESOLVED_STATUS_VALUES),
+        "date_range_fields": sorted(DATE_TAG_KEYS),
+        "date_range_params": [
+            "created_from",
+            "created_to",
+            "resolved_from",
+            "resolved_to",
+            "updated_from",
+            "updated_to",
+            "due_from",
+            "due_to",
+            "due_before",
+        ],
+        "sort_by": list(SORT_BY_VALUES),
+        "list_projection": [
+            "key",
+            "title",
+            "link",
+            "assignee",
+            "status",
+            "created",
+            "updated",
+            "duedate",
+            "priority",
+        ],
         "cap": MAX_CATALOG_ROWS,
         "note": (
-            "Queryable indexed tags only. Date ranges are not supported. "
+            "Queryable indexed tags only. Date ranges use created_from/created_to, "
+            "resolved_from/resolved_to, updated_from/updated_to, due_from/due_to/due_before "
+            "(YYYY-MM-DD). Resolved statuses are published here — not inferred. "
             "Emails and other PII fields are not listed and cannot be queried."
         ),
     }
@@ -221,16 +259,19 @@ def count_indexed_documents(
     *,
     source: DocumentSource | None,
     filters: list[tuple[str, str]],
+    date_ranges: list[DateRangeSpec] | None = None,
 ) -> dict[str, object]:
     """Exact unique indexed document count, optionally AND-filtered by tags.
 
     Unfiltered counts use connector membership (has_been_indexed). Names/labels
     use contains; key/parent/status/dates use case-insensitive equality.
+    Date ranges compare the YYYY-MM-DD prefix of stored date tags.
 
     Args:
         db_session: Tenant DB session.
         source: Restrict to this DocumentSource, or all sources.
         filters: Allow-listed field/value pairs combined with AND.
+        date_ranges: Optional governed date comparisons (due_before, created_from, …).
 
     Returns:
         count, source, filters with matched values, truncated-style caps.
@@ -238,16 +279,23 @@ def count_indexed_documents(
     Raises:
         DocumentCountError: Invalid filter arguments.
     """
+    ranges = date_ranges or []
+    range_ids = intersect_date_range_ids(db_session, source, ranges)
     if not filters:
-        count = _count_indexed_by_source(db_session, source)
+        if range_ids is None:
+            count = _count_indexed_by_source(db_session, source)
+        else:
+            count = len(range_ids)
         return _count_payload(count, source, [])
 
     resolved = _resolve_filters(db_session, source, filters)
     if any(not item["matched_values"] for item in resolved):
         return _count_payload(0, source, resolved)
     specs = [(item["filter_field"], item["matched_values"]) for item in resolved]
-    count = _count_docs_matching_and(db_session, source, specs)
-    return _count_payload(count, source, resolved)
+    tag_ids = _intersect_doc_ids(db_session, source, specs)
+    if range_ids is not None:
+        tag_ids = tag_ids & range_ids
+    return _count_payload(len(tag_ids), source, resolved)
 
 
 def _count_payload(
@@ -344,15 +392,6 @@ def _indexed_doc_ids_for_values(
     if source is not None:
         stmt = stmt.where(Tag.source == source)
     return {str(doc_id) for doc_id in db_session.execute(stmt).scalars().all()}
-
-
-def _count_docs_matching_and(
-    db_session: Session,
-    source: DocumentSource | None,
-    specs: list[tuple[str, list[str]]],
-) -> int:
-    ids = _intersect_doc_ids(db_session, source, specs)
-    return len(ids)
 
 
 def _intersect_doc_ids(

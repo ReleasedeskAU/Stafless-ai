@@ -47,6 +47,10 @@ JIRA_COMPLETENESS_FIELDS = (
     "duedate",
     "resolution_date",
     "parent",
+    "issuelink",
+    "issuelink_type",
+    "last_updater",
+    "status_was",
 )
 
 
@@ -260,6 +264,7 @@ _ADF_CONTAINERS = frozenset(
 )
 _ADF_BLOCK_BREAKS = frozenset({"paragraph", "heading", "listItem", "blockquote"})
 _JIRA_COMMENT_PAGE_SIZE = 100
+_JIRA_CHANGELOG_PAGE_SIZE = 100
 _JIRA_429_DEFAULT_WAIT_SEC = 30
 _JIRA_429_MAX_WAIT_SEC = 300
 _JIRA_429_MAX_RETRIES = 8
@@ -402,6 +407,129 @@ def jira_body_text(payload: Any) -> str:
         if isinstance(value, dict):
             return extract_text_from_adf(value)
     return ""
+
+
+def jira_issue_link_pairs(issue: Any) -> list[tuple[str, str]]:
+    """(link type phrase, linked key) from the issue payload. No live follow-up fetch."""
+    raw = best_effort_get_field_from_issue(issue, "issuelinks")
+    if not raw:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    pairs: list[tuple[str, str]] = []
+    for item in items:
+        pair = _one_issue_link(item)
+        if pair:
+            pairs.append(pair)
+    return pairs
+
+
+def jira_changelog_payload(issue: Any) -> dict[str, Any] | None:
+    """Changelog already on the issue (expand=changelog). None if it was not fetched."""
+    raw = getattr(issue, "raw", None)
+    if isinstance(raw, dict) and isinstance(raw.get("changelog"), dict):
+        return raw["changelog"]
+    changelog = getattr(issue, "changelog", None)
+    if isinstance(changelog, dict):
+        return changelog
+    if changelog is not None:
+        nested = getattr(changelog, "raw", None)
+        if isinstance(nested, dict):
+            return nested
+        histories = getattr(changelog, "histories", None)
+        if histories is not None:
+            return {"histories": list(histories)}
+    return None
+
+
+def changelog_is_truncated(changelog: dict[str, Any]) -> bool:
+    """True when the expand payload is a prefix of the full history."""
+    histories = _changelog_histories(changelog)
+    total = changelog.get("total")
+    return isinstance(total, int) and total > len(histories)
+
+
+def fetch_all_jira_changelog(jira_client: JIRA, issue_key: str) -> dict[str, Any]:
+    """Page the issue changelog API. Used at index time when expand is truncated."""
+    histories: list[Any] = []
+    start_at = 0
+    total: int | None = None
+    changelog_url = jira_client._get_url(f"issue/{issue_key}/changelog")
+    while True:
+        params = {"maxResults": _JIRA_CHANGELOG_PAGE_SIZE, "startAt": start_at}
+        response = jira_session_request(
+            jira_client._session, "get", changelog_url, params=params
+        )
+        payload = response.json()
+        page = payload.get("values") or payload.get("histories") or []
+        histories.extend(page)
+        if isinstance(payload.get("total"), int):
+            total = payload["total"]
+        start_at += len(page)
+        if not page:
+            break
+        if total is not None and start_at >= total:
+            break
+    return {"histories": histories, "total": total if total is not None else len(histories)}
+
+
+def jira_last_updater(changelog: dict[str, Any]) -> str | None:
+    """Display name of the most recent changelog author. Never an email."""
+    latest: tuple[str, str] | None = None
+    for history in _changelog_histories(changelog):
+        if not isinstance(history, dict):
+            continue
+        created = _stringish(history.get("created")) or ""
+        name = jira_user_display_name(history.get("author"))
+        if not name:
+            continue
+        if latest is None or created >= latest[0]:
+            latest = (created, name)
+    return latest[1] if latest else None
+
+
+def jira_status_was_values(changelog: dict[str, Any]) -> list[str]:
+    """Distinct status names that appear in changelog from/to strings."""
+    seen: list[str] = []
+    for history in _changelog_histories(changelog):
+        if not isinstance(history, dict):
+            continue
+        for item in history.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("field") or "").lower() != "status":
+                continue
+            for key in ("fromString", "toString"):
+                value = _stringish(item.get(key))
+                if value and value not in seen:
+                    seen.append(value)
+    return seen
+
+
+def _changelog_histories(changelog: dict[str, Any]) -> list[Any]:
+    histories = changelog.get("histories") or changelog.get("values") or []
+    return list(histories) if isinstance(histories, list) else []
+
+
+def _one_issue_link(item: Any) -> tuple[str, str] | None:
+    raw = item if isinstance(item, dict) else getattr(item, "raw", None)
+    if not isinstance(raw, dict):
+        raw = {
+            "type": getattr(item, "type", None),
+            "inwardIssue": getattr(item, "inwardIssue", None),
+            "outwardIssue": getattr(item, "outwardIssue", None),
+        }
+    link_type = raw.get("type") if isinstance(raw.get("type"), dict) else {}
+    inward = raw.get("inwardIssue")
+    outward = raw.get("outwardIssue")
+    if inward is not None:
+        phrase = _stringish(link_type.get("inward")) or "is related to"
+        key = jira_key_value(inward)
+        return (phrase, key) if key else None
+    if outward is not None:
+        phrase = _stringish(link_type.get("outward")) or "relates to"
+        key = jira_key_value(outward)
+        return (phrase, key) if key else None
+    return None
 
 
 def jira_issue_key(issue: Any) -> str:

@@ -24,6 +24,7 @@ from onyx.db.document_count import (
     parse_document_key,
     require_filter_field,
 )
+from onyx.db.document_date_filter import parse_date_range_args
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
@@ -54,7 +55,21 @@ class CatalogFilter(BaseModel):
     filter_value: str = Field(max_length=80)
 
 
-class DocumentCountRequest(BaseModel):
+class DateRangeMixin(BaseModel):
+    """YYYY-MM-DD range params. Extra fields stay forbidden on the child model."""
+
+    created_from: str | None = Field(default=None, max_length=10)
+    created_to: str | None = Field(default=None, max_length=10)
+    resolved_from: str | None = Field(default=None, max_length=10)
+    resolved_to: str | None = Field(default=None, max_length=10)
+    updated_from: str | None = Field(default=None, max_length=10)
+    updated_to: str | None = Field(default=None, max_length=10)
+    due_from: str | None = Field(default=None, max_length=10)
+    due_to: str | None = Field(default=None, max_length=10)
+    due_before: str | None = Field(default=None, max_length=10)
+
+
+class DocumentCountRequest(DateRangeMixin):
     """Exact unique-document count. Extra fields are rejected."""
 
     model_config = ConfigDict(extra="forbid")
@@ -62,6 +77,21 @@ class DocumentCountRequest(BaseModel):
     filter_field: str | None = Field(default=None, max_length=40)
     filter_value: str | None = Field(default=None, max_length=80)
     filters: list[CatalogFilter] | None = Field(default=None, max_length=5)
+
+
+def _date_ranges(body: DateRangeMixin):
+    """Parse optional YYYY-MM-DD range fields from a count or list request."""
+    return parse_date_range_args(
+        created_from=body.created_from,
+        created_to=body.created_to,
+        resolved_from=body.resolved_from,
+        resolved_to=body.resolved_to,
+        updated_from=body.updated_from,
+        updated_to=body.updated_to,
+        due_from=body.due_from,
+        due_to=body.due_to,
+        due_before=body.due_before,
+    )
 
 
 def _parsed_filters(
@@ -89,6 +119,7 @@ def document_count(
             db_session,
             source=parse_count_source(body.source),
             filters=_parsed_filters(body.filter_field, body.filter_value, body.filters),
+            date_ranges=_date_ranges(body),
         )
     except DocumentCountError:
         raise HTTPException(status_code=400, detail="Invalid count request") from None
@@ -100,6 +131,7 @@ class DocumentFieldRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source: str | None = Field(default=None, max_length=40)
     field: str = Field(max_length=40)
+    date_bucket: str | None = Field(default=None, max_length=16)
 
 
 class DocumentByKeyRequest(BaseModel):
@@ -110,7 +142,7 @@ class DocumentByKeyRequest(BaseModel):
     key: str = Field(max_length=40)
 
 
-class DocumentMatchRequest(BaseModel):
+class DocumentMatchRequest(DateRangeMixin):
     """List indexed documents matching AND metadata filters. Extra fields rejected."""
 
     model_config = ConfigDict(extra="forbid")
@@ -118,6 +150,7 @@ class DocumentMatchRequest(BaseModel):
     filter_field: str | None = Field(default=None, max_length=40)
     filter_value: str | None = Field(default=None, max_length=80)
     filters: list[CatalogFilter] | None = Field(default=None, max_length=5)
+    sort_by: str | None = Field(default=None, max_length=20)
 
 
 class DocumentFieldsRequest(BaseModel):
@@ -165,6 +198,7 @@ def document_breakdown(
             db_session,
             source=parse_count_source(body.source),
             filter_field=require_filter_field(body.field),
+            date_bucket=body.date_bucket,
         )
     except DocumentCountError:
         raise HTTPException(status_code=400, detail="Invalid catalog request") from None
@@ -203,6 +237,8 @@ def document_list(
             db_session,
             source=parse_count_source(body.source),
             filters=filters,
+            date_ranges=_date_ranges(body),
+            sort_by=body.sort_by,
         )
     except DocumentCountError:
         raise HTTPException(status_code=400, detail="Invalid catalog request") from None

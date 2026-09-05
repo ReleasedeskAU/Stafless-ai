@@ -81,6 +81,12 @@ def test_pii_fields_are_never_queryable() -> None:
             parse_filter_field(blocked)
     assert "parent" in fields
     assert "duedate" in fields
+    assert "issuelink" in fields
+    assert "last_updater" in fields
+    assert "status_was" in fields
+    assert schema["resolved_statuses"] == ["Done"]
+    assert "due_before" in schema["date_range_params"]
+    assert "created_asc" in schema["sort_by"]
 
 
 def test_key_and_parent_are_exact_not_contains() -> None:
@@ -93,6 +99,7 @@ def test_key_and_parent_are_exact_not_contains() -> None:
 
 
 def test_names_and_labels_keep_contains_match() -> None:
+    assert stored_value_matches_filter("last_updater", "Release Desk", "Release") is True
     assert stored_value_matches_filter("assignee", "Mohd Kabir", "Kabir") is True
     assert stored_value_matches_filter("labels", "release123", "release") is True
     assert stored_value_matches_filter("status", "To Do", "todo") is False

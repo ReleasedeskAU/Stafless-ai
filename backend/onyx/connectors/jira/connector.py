@@ -44,14 +44,20 @@ from onyx.connectors.jira.utils import (
     best_effort_get_field_from_issue,
     build_jira_client,
     build_jira_url,
+    changelog_is_truncated,
+    fetch_all_jira_changelog,
     get_comment_strs,
+    jira_changelog_payload,
     jira_issue_key,
+    jira_issue_link_pairs,
     jira_issue_plain_field,
     jira_key_value,
     jira_label_values,
+    jira_last_updater,
     jira_named_value,
     jira_sdk_call,
     jira_session_request,
+    jira_status_was_values,
     jira_user_display_name,
     jira_user_email,
 )
@@ -98,6 +104,11 @@ _FIELD_PROJECT_NAME = "project_name"
 _FIELD_UPDATED = "updated"
 _FIELD_RESOLUTION_DATE = "resolutiondate"
 _FIELD_RESOLUTION_DATE_KEY = "resolution_date"
+_FIELD_ISSUELINKS = "issuelinks"
+_FIELD_ISSUELINK = "issuelink"
+_FIELD_ISSUELINK_TYPE = "issuelink_type"
+_FIELD_LAST_UPDATER = "last_updater"
+_FIELD_STATUS_WAS = "status_was"
 
 
 def _is_cloud_client(jira_client: JIRA) -> bool:
@@ -270,6 +281,8 @@ def _bulk_fetch_request(
     # Only restrict fields if specified, might want to explicitly do this in the future
     # to avoid reading unnecessary data
     payload["fields"] = fields.split(",") if fields else ["*all"]
+    # Changelog is an expand, not a field — required to index last_updater / status_was.
+    payload["expand"] = ["changelog"]
 
     resp = jira_session_request(
         jira_client._session,
@@ -399,6 +412,7 @@ def _perform_jql_search_v2(
             startAt=start,
             maxResults=max_results,
             fields=fields,
+            expand="changelog",
         )
     except JIRAError as e:
         _handle_jira_search_error(e, jql)
@@ -608,7 +622,78 @@ def _build_jira_metadata(
             tagged=bool(project_name),
             issue_key=str(issue_key),
         )
+    _put_issue_link_metadata(metadata, stats, str(issue_key), issue)
     return metadata, people
+
+
+def _put_issue_link_metadata(
+    metadata: dict[str, str | list[str]],
+    stats: JiraFieldStats | None,
+    issue_key: str,
+    issue: Issue,
+) -> None:
+    """Index Jira issuelinks as type + type:key tags. Parent/child is a separate field."""
+    links_payload = best_effort_get_field_from_issue(issue, _FIELD_ISSUELINKS)
+    pairs = jira_issue_link_pairs(issue)
+    phrases: list[str] = []
+    combined: list[str] = []
+    for phrase, key in pairs:
+        combined.append(f"{phrase}:{key}")
+        if phrase not in phrases:
+            phrases.append(phrase)
+    if combined:
+        metadata[_FIELD_ISSUELINK] = combined
+        metadata[_FIELD_ISSUELINK_TYPE] = phrases
+    if stats is not None:
+        present = links_payload is not None
+        stats.observe(
+            _FIELD_ISSUELINK,
+            present=present,
+            tagged=bool(combined),
+            issue_key=issue_key,
+            reason="unusable issuelinks" if present and not combined else None,
+        )
+        stats.observe(
+            _FIELD_ISSUELINK_TYPE,
+            present=present,
+            tagged=bool(phrases),
+            issue_key=issue_key,
+        )
+
+
+def _put_changelog_metadata(
+    metadata: dict[str, str | list[str]],
+    stats: JiraFieldStats | None,
+    issue_key: str,
+    issue: Issue,
+    jira_client: JIRA | None,
+) -> None:
+    """Index last updater and prior statuses from StaffLess-fetched changelog."""
+    changelog = jira_changelog_payload(issue)
+    present = changelog is not None
+    if changelog and changelog_is_truncated(changelog) and jira_client is not None:
+        changelog = fetch_all_jira_changelog(jira_client, issue_key)
+        present = True
+    updater = jira_last_updater(changelog) if changelog else None
+    status_was = jira_status_was_values(changelog) if changelog else []
+    if updater:
+        metadata[_FIELD_LAST_UPDATER] = updater
+    if status_was:
+        metadata[_FIELD_STATUS_WAS] = status_was
+    if stats is not None:
+        stats.observe(
+            _FIELD_LAST_UPDATER,
+            present=present,
+            tagged=bool(updater),
+            issue_key=issue_key,
+            reason="missing changelog author" if present and not updater else None,
+        )
+        stats.observe(
+            _FIELD_STATUS_WAS,
+            present=present,
+            tagged=bool(status_was),
+            issue_key=issue_key,
+        )
 
 
 def process_jira_issue(
@@ -677,6 +762,7 @@ def process_jira_issue(
     created = best_effort_get_field_from_issue(issue, _FIELD_CREATED)
     page_url = build_jira_url(jira_base_url, issue_key)
     metadata_dict, people = _build_jira_metadata(issue, field_stats)
+    _put_changelog_metadata(metadata_dict, field_stats, issue_key, issue, jira_client)
     if field_stats is not None:
         field_stats.issues_processed += 1
 

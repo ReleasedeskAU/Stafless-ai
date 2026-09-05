@@ -10,6 +10,9 @@ from onyx.connectors.jira.utils import (
     JiraFieldStats,
     best_effort_basic_expert_info,
     best_effort_get_field_from_issue,
+    jira_issue_link_pairs,
+    jira_last_updater,
+    jira_status_was_values,
     jira_user_display_name,
     jira_user_email,
 )
@@ -155,6 +158,52 @@ def test_raw_fields_win_over_lazy_resource_getattr() -> None:
     doc = process_jira_issue("https://example.atlassian.net", issue)
     assert doc is not None
     assert doc.metadata["assignee"] == "kiran.reddy"
+
+
+def test_issuelinks_are_tagged_as_type_and_key() -> None:
+    issue = _issue("RD-72", assignee=None)
+    issue.raw["fields"]["issuelinks"] = [
+        {
+            "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+            "inwardIssue": {"key": "RD-73"},
+        },
+        {
+            "type": {"name": "Relates", "inward": "relates to", "outward": "relates to"},
+            "outwardIssue": {"key": "RD-74"},
+        },
+    ]
+    doc = process_jira_issue("https://example.atlassian.net", issue)
+    assert doc is not None
+    assert doc.metadata["issuelink_type"] == ["is blocked by", "relates to"]
+    assert doc.metadata["issuelink"] == ["is blocked by:RD-73", "relates to:RD-74"]
+    assert jira_issue_link_pairs(issue)[0] == ("is blocked by", "RD-73")
+
+
+def test_changelog_tags_last_updater_and_status_was() -> None:
+    issue = _issue("RD-3", assignee=None)
+    issue.raw["changelog"] = {
+        "total": 2,
+        "histories": [
+            {
+                "created": "2023-01-01T00:00:00.000+0000",
+                "author": {"displayName": "Jalla"},
+                "items": [{"field": "status", "fromString": "To Do", "toString": "Done"}],
+            },
+            {
+                "created": "2023-08-23T12:00:00.000+0000",
+                "author": {"displayName": "Release Desk"},
+                "items": [
+                    {"field": "status", "fromString": "Done", "toString": "To Do"}
+                ],
+            },
+        ],
+    }
+    doc = process_jira_issue("https://example.atlassian.net", issue)
+    assert doc is not None
+    assert doc.metadata["last_updater"] == "Release Desk"
+    assert doc.metadata["status_was"] == ["To Do", "Done"]
+    assert jira_last_updater(issue.raw["changelog"]) == "Release Desk"
+    assert "Reopened" not in jira_status_was_values(issue.raw["changelog"])
 
 
 def test_completeness_mismatch_is_detectable() -> None:
